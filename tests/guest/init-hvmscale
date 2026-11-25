@@ -1,0 +1,23 @@
+#!/bin/sh
+# dom0 init for tests/gce-bench.sh --hvm: one HVM guest (an unmodified
+# Linux, DESIGN.md §5.11) with HVM_VCPUS vCPUs and HVM_MEM MiB
+# (kernel command line), running tests/guest/init-hvmscalevm; its
+# results on the serial port (its console).  HVM_ARGS: more of the guest's
+# kernel command line, commas for spaces.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+fail() { echo "HVMSCALE: FAIL: $*"; l4hctl list; poweroff -f; }
+vcpus=${HVM_VCPUS:-$(nproc)} mem=${HVM_MEM:-8192}
+echo "HVMSCALE: start, dom0 cpus $(nproc), guest $vcpus vCPUs, $mem MiB"
+l4hctl info | sed 's/^/HVMSCALE: info /'
+id=$(l4hctl create hvmscale --hvm --kernel /bin/bzImage --initrd /bin/hvmscalevm.cpio.gz \
+    --mem "$mem" --vcpus "$vcpus" --cmdline "console=ttyS0 quiet $(echo "${HVM_ARGS:-}" | tr , ' ')") || fail "create"
+# The guest's console is on the serial port too, as [vm1] lines.
+l4hctl console "$id" --until "HVMSCALE: guest done" --timeout 900 > /tmp/out || fail "guest did not finish"
+sleep 1
+grep -q "HVMSCALE: guest PASS" /tmp/out || fail "guest benchmark"
+l4hctl destroy "$id" 2>/dev/null
+echo "HVMSCALE: PASS"
+poweroff -f

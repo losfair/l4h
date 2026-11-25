@@ -237,11 +237,43 @@ pub fn entry_pc() -> u64 {
     vm().entry.rip
 }
 
-/// Wake vCPU `v`'s thread: out of seL4_VMEnter, or out of HLT.
+/// What wakers and a halted vCPU's thread share (Vcpu::halt_poll, as
+/// KVM's kvm_vcpu_kick of a polling vCPU): whether it polls, so that a
+/// waker can leave it to see the request instead of signalling it (a
+/// syscall under FL4's serial gate, and a reschedule IPI when it has
+/// blocked); when a wake was last asked for, so that the poll window
+/// follows how long polling would have had to wait; and how many signals
+/// were sent, so that a poll that caught its wake takes a signal only
+/// when there may be one.
+#[repr(align(64))]
+pub struct Waker {
+    pub polling: AtomicBool,
+    pub asked: AtomicU64,
+    pub signals: AtomicU64,
+}
+
+pub static WAKERS: [Waker; hv::MAX_VCPUS] =
+    [const { Waker { polling: AtomicBool::new(false), asked: AtomicU64::new(0), signals: AtomicU64::new(0) } }; hv::MAX_VCPUS];
+
+/// Wake vCPU `v`'s thread: out of seL4_VMEnter, or out of HLT.  The
+/// request (its APIC's state, its flags) is written first.  Against
+/// Vcpu::halt_poll's store of `polling` and then load of the request,
+/// this store of the request and then load of `polling`, each with a
+/// SeqCst fence between: either the poller sees the request or this
+/// sees it polling (and it sees the request when it stops, as it checks
+/// once more after clearing `polling`).
 pub fn wake(v: usize) {
-    if me() != Some(v) {
-        crate::sys::wake(v);
+    if me() == Some(v) {
+        return;
     }
+    let w = &WAKERS[v];
+    w.asked.store(now(), Ordering::Relaxed);
+    core::sync::atomic::fence(Ordering::SeqCst);
+    if w.polling.load(Ordering::Relaxed) {
+        return;
+    }
+    w.signals.fetch_add(1, Ordering::Relaxed);
+    crate::sys::wake(v);
 }
 
 impl Vm {

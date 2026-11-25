@@ -48,21 +48,32 @@ pub fn with_addr(old: u64, v: u64, addr: u8) -> u64 {
 struct Span {
     parts: [(u64, u64); 2],
 }
-/// The longest a halted vCPU polls before it blocks (Vcpu::halt_poll).
-const HALT_POLL_US: u64 = 100;
+/// The longest a halted vCPU polls before it blocks (Vcpu::halt_poll),
+/// as KVM's default halt_poll_ns.  Nested, a block and its wakeup cost
+/// tens of microseconds (exits of FL4's own, its idle loop's HLT).
+const HALT_POLL_US: u64 = 200;
 /// A vCPU polls only while other guests leave its CPU about this much
 /// capacity (EventPage::host_cap, of 1024).  The hint is smoothed and
 /// rounds down, so it settles a little below 1024 after any neighbour's
 /// use; below this, polling would take a contended CPU from others.
 const HALT_POLL_MIN_CAP: u64 = 992;
 
-/// The next halt-poll window (TSC ticks), after a halt that blocked for
-/// `blocked` with the window `window`, as Linux's halt polling and the
-/// PV guest's idle loop adapt it (arch/l4h/kernel/time.c): a block that
-/// polling up to `max` would have caught grows it (from an eighth of
-/// `max`, doubling to `max`); a longer one ends polling.
-pub fn halt_poll_window(window: u64, blocked: u64, max: u64) -> u64 {
-    if blocked <= max { if window == 0 { max / 8 } else { window.saturating_mul(2).min(max) } } else { 0 }
+/// The next halt-poll window (TSC ticks), after a halt whose wake came
+/// `waited` after it began, with the window `window`, as KVM adapts
+/// halt_poll_ns: a wake that polling up to `max` would have caught grows
+/// it (from an eighth of `max`, doubling to `max`); a later one halves
+/// it, and below an eighth ends polling.  `waited` is until the wake was
+/// asked for, not until the thread ran again: the wakeup's own cost is
+/// what polling saves, and counting it would keep a vCPU whose wakeups
+/// are slow from ever polling.
+pub fn halt_poll_window(window: u64, waited: u64, max: u64) -> u64 {
+    if waited <= max {
+        if window == 0 { max / 8 } else { window.saturating_mul(2).min(max) }
+    } else if window / 2 >= max / 8 {
+        window / 2
+    } else {
+        0
+    }
 }
 
 /// Whether the capacity hint `host_cap` (0: none published) says other
@@ -140,6 +151,8 @@ pub struct Vcpu<H: Hw> {
     steal_version: u32,
     /// The halt-poll window, in TSC ticks (halt_poll_window).
     poll_window: u64,
+    /// vm::WAKERS' signal count this thread's notification has taken.
+    signals_seen: u64,
     halted: bool,
     wait_sipi: bool,
     nmis: u32,
@@ -172,7 +185,7 @@ impl<H: Hw> Vcpu<H> {
         let mut c = Vcpu {
             id: v, hw, lapic: Lapic::new(vm.topology.apic_id[v], v == 0, vm.tsc_hz), msrs: msr::Msrs::new(vm.amd, vm.host.spec), tsc_offset: 0,
             kvm_time: 0, kvm_wall: 0, kvm_version: 0, pv_eoi: 0, pv_eoi_set: false,
-            steal_msr: 0, steal_acc: 0, steal_seen: 0, steal_version: 0, poll_window: 0,
+            steal_msr: 0, steal_acc: 0, steal_seen: 0, steal_version: 0, poll_window: 0, signals_seen: 0,
             halted: false, wait_sipi: v != 0, nmis: 0, inject: None, dr: [0; 4], dr6: 0xffff_0ff0, dr7: 0x400, xcr0: 1, armed: 0,
         };
         c.lapic.init(shared(v));
@@ -276,11 +289,19 @@ impl<H: Hw> Vcpu<H> {
             self.poll_window = 0;
         }
         let start = vm::now();
+        let w = &vm::WAKERS[self.id];
         if self.halted && self.poll_window != 0 && self.halt_poll(start, self.poll_window) {
-            // What woke it may have signalled this thread too: taken now,
-            // so the next VMEnter does not return at once to say so (turn
-            // looks at the state itself).
-            crate::sys::poll(self.id);
+            // A signal a waker sent, or the timer's: taken now, so the
+            // next VMEnter does not return at once to say so (turn looks
+            // at the state itself).  A waker that saw it polling sent
+            // none.
+            let signals = w.signals.load(Ordering::Relaxed);
+            if signals != self.signals_seen || (self.armed != 0 && vm::now() >= self.armed) {
+                self.signals_seen = signals;
+                crate::sys::poll(self.id);
+            }
+            let waited = w.asked.load(Ordering::Relaxed).wrapping_sub(start);
+            self.poll_window = halt_poll_window(self.poll_window, waited.min(self.poll_window), vm().tsc_hz / 1_000_000 * HALT_POLL_US);
             return;
         }
         // Idle: the time blocked.  A poll ran on the vCPU's budget, as its
@@ -288,14 +309,26 @@ impl<H: Hw> Vcpu<H> {
         // progress when vmmgr samples is idle_since's.
         let before = vm::now();
         unsafe { crate::sync::idle_begin(page, before) };
+        // Signals until now are the wait's to take (one after this read
+        // and before the wait is taken too, and only costs a poll later).
+        self.signals_seen = w.signals.load(Ordering::Relaxed);
         crate::sys::wait(self.id);
         let end = vm::now();
         unsafe { crate::sync::idle_end(page, end.wrapping_sub(before)) };
-        // The window follows the whole wait, the poll that missed
-        // included, as KVM's block_ns: a poll and a block that together
-        // outlast the maximum end polling.
+        // The window follows how long after the halt the wake was asked
+        // for, the poll that missed included (as KVM's block_ns, but
+        // without the wakeup's own cost): a waker's request, or the
+        // timer's deadline; else the whole wait.
         if self.halted && !contended {
-            self.poll_window = halt_poll_window(self.poll_window, end.wrapping_sub(start), vm().tsc_hz / 1_000_000 * HALT_POLL_US);
+            let asked = w.asked.load(Ordering::Relaxed);
+            let waited = if asked.wrapping_sub(start) <= end.wrapping_sub(start) {
+                asked.wrapping_sub(start)
+            } else if self.armed != 0 && self.armed.wrapping_sub(start) <= end.wrapping_sub(start) {
+                self.armed.wrapping_sub(start)
+            } else {
+                end.wrapping_sub(start)
+            };
+            self.poll_window = halt_poll_window(self.poll_window, waited, vm().tsc_hz / 1_000_000 * HALT_POLL_US);
         }
     }
 
@@ -310,21 +343,33 @@ impl<H: Hw> Vcpu<H> {
     fn halt_poll(&self, start: u64, ticks: u64) -> bool {
         let vm = vm();
         let sh = shared(self.id);
-        loop {
-            let now = vm::now();
-            if sh.flags.load(Ordering::Relaxed) != 0
+        let woken = |now: u64| {
+            sh.flags.load(Ordering::Relaxed) != 0
                 || (self.lapic.pending(sh).is_some() && self.hw.rflags() & (1 << 9) != 0)
                 || (self.armed != 0 && now >= self.armed)
                 || (self.id == 0
                     && (vm.ioapic_stale.load(Ordering::Relaxed) || vm.uart_stale.load(Ordering::Relaxed)))
-            {
+        };
+        // Wakers see it polling and leave the request to it (vm::wake).
+        let w = &vm::WAKERS[self.id];
+        w.polling.store(true, Ordering::Relaxed);
+        core::sync::atomic::fence(Ordering::SeqCst);
+        loop {
+            let now = vm::now();
+            if woken(now) {
+                w.polling.store(false, Ordering::Relaxed);
                 return true;
             }
             if now.wrapping_sub(start) >= ticks {
-                return false;
+                break;
             }
             core::hint::spin_loop();
         }
+        // A waker that saw it polling sent no signal: its request is
+        // visible after this.
+        w.polling.store(false, Ordering::Relaxed);
+        core::sync::atomic::fence(Ordering::SeqCst);
+        woken(vm::now())
     }
 
     /// KVM's steal time (KVM_FEATURE_STEAL_TIME): the steal vmmgr
@@ -1340,13 +1385,14 @@ mod tests {
             w = halt_poll_window(w, max / 10, max);
             assert_eq!(w, want);
         }
-        // A block polling would not have caught ends polling at once.
-        assert_eq!(halt_poll_window(w, max + 1, max), 0);
+        // A wake polling would not have caught halves it, down to an
+        // eighth; then polling ends.
+        assert_eq!(halt_poll_window(w, max + 1, max), max / 2);
+        assert_eq!(halt_poll_window(max / 2, max + 1, max), max / 4);
+        assert_eq!(halt_poll_window(max / 4, max + 1, max), max / 8);
+        assert_eq!(halt_poll_window(max / 8, max + 1, max), 0);
         assert_eq!(halt_poll_window(0, u64::MAX, max), 0, "a mostly idle vCPU never polls");
-        assert_eq!(halt_poll_window(max, max, max), max, "a block within the maximum keeps it");
-        // A poll that missed and the block after it count together: 100
-        // and 50 outlast the maximum.
-        assert_eq!(halt_poll_window(max, max + max / 2, max), 0);
+        assert_eq!(halt_poll_window(max, max, max), max, "a wake within the maximum keeps it");
     }
 
     #[test]
