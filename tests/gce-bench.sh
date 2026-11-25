@@ -17,20 +17,33 @@
 # getpid on one process per CPU for 1, 16, 32, ... and all dom0 vCPUs
 # (tests/guest/init-getpidscale; PROBE_RANGES="0 0-31 ..." picks others),
 # with dom0 on every host CPU as for --scale.
+# --hvm measures many-core HVM scaling instead: dom0 (2 vCPUs, VCPUS=n)
+# runs one HVM guest, an unmodified Linux (tools/build-linux-hvm.sh), with
+# HVM_VCPUS vCPUs (default the machine's, at most 64) and HVM_MEM MiB
+# (default 8192), and that guest runs getpidscale and smpbench at 1, 2,
+# 4, ... and all its CPUs (tests/guest/init-hvmscale, init-hvmscalevm).
+# HVM_ARGS="a b" adds to the guest's kernel command line: HVMFORK=1 runs
+# fork scaling alone (forkscale), HVMEXIT=1 the VM exit round trip
+# (exitlat's CPUID) and cross-CPU ping-pong. The instance has nested
+# virtualization (VT-x or AMD-V for FL4). C4 has 24 vCPUs of quota per
+# region in most of them; europe-north2 and northamerica-south1 have 72.
+# --hvmtest runs tests/guest/init-hvmtest there instead (run-hvmtest.sh's
+# HVM guests: SMP, disk, network, console, power button, destroy), on an
+# instance without a vTPM, as that test expects.
 # --aarch64 benchmarks L4H on FL4 for AArch64 on an Arm C4A (default
 # c4a-standard-4 in us-central1-b), dom0 in FL4's UEFI application.
-# Usage: gce-bench.sh [--sev-snp|--aarch64] [--scale|--probe] PROJECT [ZONE] [MACHINE_TYPE]
+# Usage: gce-bench.sh [--sev-snp|--aarch64] [--scale|--probe|--hvm|--hvmtest] PROJECT [ZONE] [MACHINE_TYPE]
 # e.g.   gce-bench.sh PROJECT us-central1-a n4-standard-4
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 export L4H_RELEASE=1 L4H_ARCH=x86_64 L4H_KERNEL_VARIANT=fl4 SEL4_PREFIX=$root/build/sel4-fl4
 source "$root/tools/host-profile.sh"
 usage() {
-    echo "Usage: gce-bench.sh [--sev-snp|--aarch64] [--scale|--probe] PROJECT [ZONE] [MACHINE_TYPE]" >&2
+    echo "Usage: gce-bench.sh [--sev-snp|--aarch64] [--scale|--probe|--hvm|--hvmtest] PROJECT [ZONE] [MACHINE_TYPE]" >&2
     exit 2
 }
 # Options anywhere; after --, arguments only.
-snp= scale= arm= probe=
+snp= scale= arm= probe= hvm= hvmtest=
 pos=()
 while [ $# -gt 0 ]; do
     case $1 in
@@ -38,14 +51,16 @@ while [ $# -gt 0 ]; do
         --aarch64) arm=1 ;;
         --scale) scale=1 ;;
         --probe) probe=1 ;;
+        --hvm) hvm=1 ;;
+        --hvmtest) hvm=1 hvmtest=1 ;;
         --) shift; pos+=("$@"); break ;;
         -*) echo "gce-bench.sh: unknown option $1" >&2; usage ;;
         *) pos+=("$1") ;;
     esac
     shift
 done
-if [ -n "$scale" ] && [ -n "$probe" ]; then
-    echo "gce-bench.sh: --scale and --probe cannot be combined" >&2
+if [ $(( ${scale:-0} + ${probe:-0} + ${hvm:-0} )) -gt 1 ]; then
+    echo "gce-bench.sh: --scale, --probe and --hvm cannot be combined" >&2
     exit 2
 fi
 if [ -n "$arm" ] && [ -n "$snp" ]; then
@@ -70,6 +85,10 @@ if [ -n "$arm" ]; then
     iface=()
     cc=aarch64-linux-gnu-gcc
     export L4H_ARCH=aarch64 SEL4_PREFIX=$root/build/sel4-fl4-aarch64
+fi
+if [ -n "$hvm" ]; then
+    [ -z "$arm$snp" ] || { echo "gce-bench.sh: --hvm is for x86-64 without --sev-snp" >&2; exit 2; }
+    gce_args+=(--enable-nested-virtualization)
 fi
 if [ -n "$snp" ]; then
     machine=${3:-n2d-standard-4}
@@ -133,7 +152,41 @@ else
 fi
 "$cc" -O2 -static -Wall -Wextra -Werror -o "$work/syscallbench" "$root/tests/guest/syscallbench.c"
 cmdline="console=hvc0 quiet"
-if [ -n "$probe" ]; then
+if [ -n "$hvmtest" ]; then
+    build_step l4hctl-build "$root/tools/build-l4hctl.sh"
+    build_step linux-hvm-build "$root/tools/build-linux-hvm.sh"
+    cp "$root/build/linux-hvm/arch/x86/boot/bzImage" "$work/bzImage"
+    ctl=$root/tools/l4hctl/target/release/l4hctl
+    "$root/tools/mkinitramfs.sh" "$work/hvmvm.cpio.gz" "$root/tests/guest/init-hvmvm" "$ctl" >/dev/null
+    "$root/tools/mkinitramfs.sh" "$work/netvm.cpio.gz" "$root/tests/guest/init-netvm" "$root/tests/guest/udhcpc.script" >/dev/null
+    "$root/tools/mkinitramfs.sh" "$work/dom0.cpio.gz" "$root/tests/guest/init-hvmtest" \
+        "$ctl" "$work/bzImage" "$work/hvmvm.cpio.gz" "$work/netvm.cpio.gz" >/dev/null
+    marker=HVMTEST
+    # As run-hvmtest.sh's host: no TPM (the test checks for none).
+    gce_args+=(--no-shielded-vtpm --no-shielded-integrity-monitoring)
+    vcpus=${VCPUS:-4}
+    mem_mb=512
+elif [ -n "$hvm" ]; then
+    build_step l4hctl-build "$root/tools/build-l4hctl.sh"
+    build_step linux-hvm-build "$root/tools/build-linux-hvm.sh"
+    cp "$root/build/linux-hvm/arch/x86/boot/bzImage" "$work/bzImage"
+    "$cc" -O2 -static -Wall -Wextra -Werror -o "$work/getpidscale" "$root/tests/guest/getpidscale.c"
+    "$cc" -O2 -static -Wall -Wextra -Werror -o "$work/smpbench" "$root/tests/guest/smpbench.c"
+    "$cc" -O2 -static -Wall -Wextra -Werror -o "$work/forkscale" "$root/tests/guest/forkscale.c"
+    "$cc" -O2 -static -Wall -Wextra -Werror -o "$work/exitlat" "$root/tests/guest/exitlat.c"
+    "$root/tools/mkinitramfs.sh" "$work/hvmscalevm.cpio.gz" "$root/tests/guest/init-hvmscalevm" \
+        "$work/getpidscale" "$work/smpbench" "$work/forkscale" "$work/exitlat" >/dev/null
+    "$root/tools/mkinitramfs.sh" "$work/dom0.cpio.gz" "$root/tests/guest/init-hvmscale" \
+        "$root/tools/l4hctl/target/release/l4hctl" "$work/bzImage" "$work/hvmscalevm.cpio.gz" >/dev/null
+    marker=HVMSCALE
+    vcpus=${VCPUS:-2}
+    hvm_vcpus=${HVM_VCPUS:-$(gcloud compute machine-types describe "$machine" --project="$project" \
+        --zone="$zone" --format='value(guestCpus)')}
+    [ "$hvm_vcpus" -le 64 ] || hvm_vcpus=64
+    cmdline+=" HVM_VCPUS=$hvm_vcpus HVM_MEM=${HVM_MEM:-8192}"
+    [ -n "${HVM_ARGS:-}" ] && cmdline+=" HVM_ARGS=$(echo "$HVM_ARGS" | tr ' ' ,)"
+    mem_mb=1024
+elif [ -n "$probe" ]; then
     "$cc" -O2 -static -Wall -Wextra -Werror -o "$work/getpidscale" "$root/tests/guest/getpidscale.c"
     "$root/tools/mkinitramfs.sh" "$work/dom0.cpio.gz" "$root/tests/guest/init-getpidscale" \
         "$work/getpidscale" >/dev/null
@@ -207,6 +260,6 @@ while [ $SECONDS -lt $end ]; do
         >"$log" 2>/dev/null || continue
     grep -aqE "$marker: (PASS|FAIL)" "$log" && break
 done
-grep -aE "$marker|SYSCALLBENCH|SMPBENCH|GETPIDSCALE|FL4: speculation|FL4: AMD SEV|FL4: ITS|l4h-root: MSIs through|no MSIs|FL4: [0-9]+ core|l4h-root: [0-9]+ core|panic|fault" "$log" || true
+grep -aE "$marker|HVMSCALE|HVMVM|NETVM|SYSCALLBENCH|SMPBENCH|GETPIDSCALE|FL4: speculation|FL4: AMD SEV|FL4: ITS|l4h-root: MSIs through|no MSIs|FL4: [0-9]+ core|l4h-root: [0-9]+ core|panic|fault" "$log" || true
 echo "serial log: $log"
 grep -aqE "$marker: PASS" "$log"

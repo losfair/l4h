@@ -180,6 +180,25 @@ fn xsave_size(xcr0: u64, host: &impl Fn(u32, u32) -> [u32; 4]) -> u32 {
     size
 }
 
+/// Bytes of a compacted (XSAVEC) XSAVE area holding the features in
+/// `xcr0`: the components in order after the header, each 64-byte
+/// aligned where the host's subleaf says so (ECX bit 1).  Intel's
+/// standard format leaves MPX's room before AVX-512's state, so the two
+/// differ there; AMD's has no gap.
+fn xsave_compacted_size(xcr0: u64, host: &impl Fn(u32, u32) -> [u32; 4]) -> u32 {
+    let mut size: u32 = 576;
+    for f in 2..10u32 {
+        if xcr0 & (1 << f) != 0 {
+            let [sz, _, c, _] = host(0xd, f);
+            if c & bit(1) != 0 {
+                size = size.next_multiple_of(64);
+            }
+            size += sz;
+        }
+    }
+    size
+}
+
 /// The guest's CPUID leaf `leaf`, subleaf `sub`, from the host's.
 pub fn cpuid(leaf: u32, sub: u32, ctx: &Ctx, host: &impl Fn(u32, u32) -> [u32; 4]) -> [u32; 4] {
     let max_std = host(0, 0)[0];
@@ -283,15 +302,15 @@ pub fn cpuid(leaf: u32, sub: u32, ctx: &Ctx, host: &impl Fn(u32, u32) -> [u32; 4
             let cur = if ctx.osxsave { ctx.xcr0 } else { 1 };
             match sub {
                 0 => [supported as u32, xsave_size(cur, host), xsave_size(supported, host), 0],
-                // XSAVEOPT, XSAVEC and XGETBV with ECX=1, not XSAVES.
-                1 => [host(0xd, 1)[0] & (bit(0) | bit(1) | bit(2)), xsave_size(cur, host), 0, 0],
-                2 if supported & 4 != 0 => {
-                    let [a, b, _, _] = host(0xd, 2);
-                    [a, b, 0, 0]
-                }
-                5..=7 | 9 if supported & (1 << sub) != 0 => {
-                    let [a, b, _, _] = host(0xd, sub);
-                    [a, b, 0, 0]
+                // XSAVEOPT, XSAVEC and XGETBV with ECX=1, not XSAVES; EBX
+                // the size of XCR0's state (IA32_XSS is 0) as XSAVEC lays
+                // it out, which Linux checks it against.
+                1 => [host(0xd, 1)[0] & (bit(0) | bit(1) | bit(2)), xsave_compacted_size(cur, host), 0, 0],
+                // User state components: their size, standard offset and
+                // XSAVEC alignment (ECX bit 1).
+                2 | 5..=7 | 9 if supported & (1 << sub) != 0 => {
+                    let [a, b, c, _] = host(0xd, sub);
+                    [a, b, c & bit(1), 0]
                 }
                 _ => [0; 4],
             }
@@ -483,6 +502,7 @@ mod tests {
         assert_eq!(cpuid(7, 1, &on, &h)[0] & bit(5), bit(5), "AVX512_BF16");
         assert_eq!(cpuid(0xd, 0, &Ctx { osxsave: true, xcr0: 0xe7, ..on }, &h), [0xe7, 2432, 2432, 0]);
         assert_eq!(cpuid(0xd, 6, &on, &h), [512, 896, 0, 0]);
+        assert_eq!(cpuid(0xd, 1, &Ctx { osxsave: true, xcr0: 0xe7, ..on }, &h)[1], 2432);
         // Without the state (seL4's VCPUs): none of it.
         let [_, b, c, _] = cpuid(7, 0, &CTX, &h);
         assert_eq!(b & (bit(16) | bit(17) | bit(21) | bit(28) | bit(30) | bit(31)), 0);
@@ -509,6 +529,36 @@ mod tests {
         let h9 = |l: u32, s: u32| if (l, s) == (0xd, 9) { [8, 2440, 0, 0] } else { h(l, s) };
         assert_eq!(cpuid(0xd, 9, &with, &h9), [8, 2440, 0, 0]);
         assert_eq!(cpuid(0xd, 0, &Ctx { osxsave: true, xcr0: 0x2e7, ..with }, &h9)[1], 2448);
+    }
+
+    #[test]
+    fn xsavec_size_on_intel_layout() {
+        // Intel (Emerald Rapids, GCE C4): MPX's room (960..1088) before
+        // AVX-512's state in the standard format, none in the compacted.
+        let h = |leaf: u32, sub: u32| match (leaf, sub) {
+            (0xd, 0) => [0x2e7, 0xa88, 0xa88, 0],
+            (0xd, 1) => [0xf, 0xa88, 0, 0],
+            (0xd, 2) => [256, 576, 0, 0],
+            (0xd, 5) => [64, 1088, 0, 0],
+            (0xd, 6) => [512, 1152, 0, 0],
+            (0xd, 7) => [1024, 1664, 0, 0],
+            (0xd, 9) => [8, 2688, 0, 0],
+            _ => host(leaf, sub),
+        };
+        let on = Ctx { osxsave: true, xcr0: 0xe7, xcr0_max: 0x2e7, ..CTX };
+        assert_eq!(cpuid(0xd, 0, &on, &h), [0x2e7, 2688, 2696, 0], "standard sizes");
+        assert_eq!(cpuid(0xd, 1, &on, &h), [7, 2432, 0, 0], "XSAVEC's size, no XSAVES");
+        assert_eq!(cpuid(0xd, 1, &Ctx { xcr0: 0x2e7, ..on }, &h)[1], 2440);
+        assert_eq!(cpuid(0xd, 1, &Ctx { xcr0: 7, ..on }, &h)[1], 832);
+        // A component 64-byte aligned in the compacted format (a made-up
+        // layout: 8 bytes of component 5, so 6 starts at 896, not 840).
+        let ha = |l: u32, s: u32| match (l, s) {
+            (0xd, 5) => [8, 1088, 0, 0],
+            (0xd, 6) => [512, 1152, 2, 0],
+            _ => h(l, s),
+        };
+        assert_eq!(cpuid(0xd, 6, &on, &ha), [512, 1152, 2, 0]);
+        assert_eq!(cpuid(0xd, 1, &on, &ha)[1], 896 + 512 + 1024);
     }
 
     #[test]

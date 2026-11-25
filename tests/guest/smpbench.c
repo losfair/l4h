@@ -127,8 +127,9 @@ static void parallel(enum workload work, const char *name, uint64_t count)
 			pages = mmap(NULL, count * PAGE_BYTES, PROT_READ | PROT_WRITE,
 				MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 			check(pages != MAP_FAILED, "fault mmap");
-			check(madvise((void *)pages, count * PAGE_BYTES, MADV_NOHUGEPAGE) == 0,
-			      "MADV_NOHUGEPAGE");
+			/* EINVAL: a kernel without THP, so no huge pages anyway. */
+			check(madvise((void *)pages, count * PAGE_BYTES, MADV_NOHUGEPAGE) == 0 ||
+			      errno == EINVAL, "MADV_NOHUGEPAGE");
 		}
 		pid_t self = getpid();
 		uint64_t checksum = 1;
