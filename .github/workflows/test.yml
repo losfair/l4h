@@ -420,7 +420,7 @@ jobs:
             build/*/*.log
 
   x86_64-variants:
-    name: x86_64 variants, fault injection & fuzz (QEMU/KVM)
+    name: x86_64 variants & fuzz (QEMU/KVM)
     needs: build-x86_64
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -452,7 +452,6 @@ jobs:
         run: tools/ci-setup.sh x86_64-host
       - name: Virtqueue fuzzing
         run: tests/run-fuzz.sh
-      # Run normal-host variants first so the host builds once before L4H_TEST_INJECT flips.
       - name: Transparent huge pages and guest ABI on the xapic-nopcid kernel
         run: |
           L4H_KERNEL_VARIANT=xapic-nopcid L4H_LAPIC_MODE=XAPIC L4H_PCID=OFF tools/build-kernel.sh
@@ -464,6 +463,46 @@ jobs:
         run: tests/run-skimtest.sh
       - name: Retained host logs and serial output in release mode
         run: L4H_RELEASE=1 tests/run-logtest.sh
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: logs-x86_64-variants
+          path: |
+            build/*.log
+            build/*/*.log
+
+  x86_64-faults:
+    name: x86_64 fault injection & no-VTX (QEMU/KVM)
+    needs: build-x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container:
+      image: debian:trixie
+      options: --device /dev/kvm
+    env:
+      L4H_PREBUILT: guest
+    steps:
+      - name: Install git
+        run: apt-get update -q && apt-get install -y -q --no-install-recommends git ca-certificates
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          submodules: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: prebuilt-x86_64
+          path: build
+      - name: Unpack prebuilt stack
+        run: tar -xf build/prebuilt-x86_64.tar && rm -f build/prebuilt-x86_64.tar
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-x86_64-${{ hashFiles('**/Cargo.lock', 'tools/ci-setup.sh') }}
+          restore-keys: cargo-x86_64-
+      - name: Set up
+        run: tools/ci-setup.sh x86_64-host
       - name: Console rings, hotplug scheduling and hypercalls under console load
         run: tests/run-devicetest.sh --qemu
       # Group L4H_TEST_INJECT=1 tests together to avoid flipping the host build back and forth.
@@ -481,7 +520,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: logs-x86_64-variants
+          name: logs-x86_64-faults
           path: |
             build/*.log
             build/*/*.log
@@ -606,6 +645,10 @@ jobs:
           path: build
       - name: Unpack prebuilt stack
         run: tar -xf build/prebuilt-x86_64.tar && rm -f build/prebuilt-x86_64.tar
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: build/busybox-1.36.1.tar.bz2
+          key: busybox-1.36.1
       - name: Set up
         run: tools/ci-setup.sh x86_64-run debian
       - name: Check KVM

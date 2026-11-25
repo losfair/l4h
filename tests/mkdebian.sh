@@ -22,7 +22,20 @@ ln -sf /etc/systemd/system/l4h-test.service $R/etc/systemd/system/multi-user.tar
 "
 # Source for the build workload (tests/run-workload.sh).
 bb=$root/build/busybox-1.36.1.tar.bz2
-[ -f "$bb" ] || wget -q -O "$bb" https://busybox.net/downloads/busybox-1.36.1.tar.bz2
+bb_sha256=b8cc24c9574d809e7279c3be349795c5d5ceb6fdf19ca709f80cde50e47de314
+if [ ! -f "$bb" ]; then
+    for url in \
+        https://busybox.net/downloads/busybox-1.36.1.tar.bz2 \
+        https://sources.buildroot.net/busybox/busybox-1.36.1.tar.bz2; do
+        if curl -sSfL --connect-timeout 15 --max-time 60 --retry 3 --retry-delay 2 -o "$bb.tmp" "$url"; then
+            echo "$bb_sha256  $bb.tmp" | sha256sum -c --quiet
+            mv "$bb.tmp" "$bb"
+            break
+        fi
+        rm -f "$bb.tmp"
+    done
+    [ -f "$bb" ] || { echo "failed to download busybox-1.36.1.tar.bz2" >&2; exit 1; }
+fi
 sudo cp "$bb" "$R/root/busybox.tar.bz2"
 sudo rm -f "$root/build/debian.img"
 sudo mkfs.ext4 -q -F -d "$R" "$root/build/debian.img" 4G
