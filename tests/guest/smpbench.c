@@ -17,7 +17,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define MAX_WORKERS 64
+#define MAX_WORKERS 256
 #define PAGE_BYTES 4096
 
 static unsigned workers, divisor = 1;

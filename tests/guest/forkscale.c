@@ -12,7 +12,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define MAX_CPUS 64
+#define MAX_CPUS 256
 
 static uint64_t now(void)
 {
