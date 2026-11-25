@@ -582,11 +582,11 @@ be installed. The checks cover:
 \begin{itemize}
   \item 64-bit UEFI with writable efivarfs and Secure Boot disabled, or
         BIOS with the distribution's GRUB (below); and ACPI;
-  \item Intel or AMD CPUs with the seL4 release's required features
+  \item Intel or AMD CPUs with the release's required features
         (including FSGSBASE, XSAVEOPT, AVX and 1 GiB pages), and APIC IDs
-        below 256. Meltdown-affected CPUs, or CPUs whose immunity cannot
-        be established, use the \texttt{skim-xapic-nopcid} variant.
-        VMX/SVM and an IOMMU are not required;
+        below 256. With an seL4 variant, Meltdown-affected CPUs, or CPUs
+        whose immunity cannot be established, use
+        \texttt{skim-xapic-nopcid}. VMX/SVM and an IOMMU are not required;
   \item at least 768 MiB usable RAM (normally 1 GiB installed). By default
         dom0 gets half the usable RAM, clamped to 512--8192 MiB.
         \texttt{--memory MiB} accepts 512--61440 MiB while leaving at least
@@ -645,10 +645,14 @@ remain locked. LACP frames pass only between each physical member and its
 dom0 interface. Ordinary guests cannot send or receive these frames.
 ConnectX-5 link changes update dom0's virtio carrier, speed and duplex.
 
-The installer chooses \texttt{skim-xapic-nopcid} when Meltdown isolation
-is needed. Otherwise it chooses generic when PCID, INVPCID and x2APIC
-are available, or xapic-nopcid. \texttt{--variant NAME} overrides this
-choice subject to the same CPU checks. CPU capabilities cannot prove the
+On UEFI the installer chooses \texttt{fl4}, the FL4 application
+(Section~\ref{sec:esp}), which detects CPU features and Meltdown at boot.
+BIOS machines and \texttt{--partitions} use seL4, since FL4 has neither a
+BIOS release nor multikernel support. For seL4 the installer chooses
+\texttt{skim-xapic-nopcid} when Meltdown isolation is needed. Otherwise
+it chooses generic when PCID, INVPCID and x2APIC are available, or
+xapic-nopcid. \texttt{--variant NAME} overrides this choice, also on
+UEFI, subject to the same CPU checks. CPU capabilities cannot prove the
 firmware's APIC state at the next boot: test the selected variant before making it permanent.
 Likewise, applications depending on native devices or kernel features,
 and network profiles matching a PCI path or native driver rather than
@@ -689,7 +693,8 @@ an installer-managed deployment. The selected release must include update
 support. The installer recognizes \file{/var/lib/l4h/install.json},
 checks that root and the boot filesystem match the existing deployment,
 and replaces the boot payload, dom0 initramfs and \cmd{l4hctl}. It preserves
-\file{l4h.conf}, the kernel variant and existing GRUB customizations.
+\file{l4h.conf}, the kernel variant and existing GRUB customizations;
+seL4 installations stay on seL4 unless updated with \texttt{--variant fl4}.
 \texttt{--memory}, \texttt{--vcpus} and \texttt{--variant} override only
 those settings; dom0 resource overrides use host capacity reported by
 \cmd{l4hctl info}, not dom0's smaller allocation. \texttt{--check} supports
@@ -829,9 +834,9 @@ variant. \cmd{tools/build-efi.sh} builds three into \file{build/efi}:
 \file{l4h-skim-xapic-nopcid.efi} (SKIM isolation, xAPIC, no PCID).
 The first two require CPUs unaffected by Meltdown; the third supports
 otherwise compatible affected CPUs, with additional page-table switching
-cost on kernel entry and return. The installer selects the appropriate
-variant. Updates preserve it; switching away from SKIM requires native
-Linux to check the host CPU.
+cost on kernel entry and return. The installer uses FL4 (below) on UEFI
+and otherwise selects the appropriate seL4 variant. Updates preserve it; switching away from SKIM, other than to
+FL4, requires native Linux to check the host CPU.
 \end{caveat}
 
 \file{l4h-fl4.efi} is an additional x86\_64 release application built with

@@ -5683,12 +5683,16 @@ curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/install.sh |
 - **Release.** It uses `sudo` when needed, installs missing dependencies
   with apt, dnf or yum, and downloads a tagged GitHub release with SHA-256
   verification. No source build or hardware virtualization is needed.
-- **Variant.** Preflight selects `skim-xapic-nopcid` for Meltdown-affected
-  CPUs or when immunity cannot be established, and `generic` (x2APIC, PCID,
-  INVPCID) or `xapic-nopcid` otherwise. All variants require FSGSBASE,
-  XSAVEOPT, AVX and 1 GiB pages. Updates keep the installed variant, and
-  switching away from SKIM needs native Linux, so the installer can check
-  the CPU.
+- **Variant.** UEFI installs use `fl4` (`l4h-fl4.efi`), which detects CPU
+  features and Meltdown at boot. BIOS installs and `--partitions` use seL4,
+  which FL4 lacks: preflight selects `skim-xapic-nopcid` for
+  Meltdown-affected CPUs or when immunity cannot be established, and
+  `generic` (x2APIC, PCID, INVPCID) or `xapic-nopcid` otherwise;
+  `--variant` selects one of these on UEFI too. All variants require
+  FSGSBASE, XSAVEOPT, AVX and 1 GiB pages. Updates keep the installed
+  variant, so existing seL4 installs stay on seL4 until `--variant fl4`.
+  Dom0 can switch to FL4 or SKIM; other switches need native Linux, so the
+  installer can check the CPU.
 - **Preflight** checks CPU features, Meltdown status, Secure Boot (must be
   off), EFI variables and the ESP (UEFI) or GRUB (BIOS), storage, network
   and userspace. `--check` runs it read-only. Some cloud VMs omit the
