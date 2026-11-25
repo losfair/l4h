@@ -65,12 +65,18 @@ impl ipc::Server for Loop {
 
     fn next(&mut self) -> ipc::Next {
         if io::more() {
-            // Polling: spin on the queues alone for a while (each turn
-            // through the kernel takes its lock, which every core's
-            // exits and IPC want), then let others on this core (another
-            // guest's I/O thread) go first.
+            // Work left at a batch's end: another turn at once, as
+            // l4h-vmm takes one.
+            ipc::Next::Poll
+        } else if io::polling() {
+            // Queues that ran dry, polled for a while (only where vmmgr
+            // allows it: an uncapped monitor alone on its core, boosted):
+            // spin on them alone (each turn through the kernel takes its
+            // lock, which every core's exits and IPC want), then look at
+            // the endpoint.  No seL4_Yield: under a limited scheduling
+            // context it would give up the rest of the budget's refill,
+            // and at PRIO_VMM it lets no lower priority run anyway.
             io::poll_spin(crate::vm::vm().tsc_hz / 1_000_000 * POLL_SPIN_US);
-            sel4::r#yield();
             ipc::Next::Poll
         } else {
             ipc::Next::Wait

@@ -203,8 +203,8 @@ typedef int64_t l4h_s64;
 /* ------------------------------------------------------------------------
  * Scheduling
  */
-#define L4H_PRIO_KERNEL         100 /* kTCB priority and MCP */
-#define L4H_PRIO_USER           99  /* priority of guest user threads */
+#define L4H_PRIO_KERNEL         100 /* kTCB priority */
+#define L4H_PRIO_USER           99  /* guest user threads' priority; the kTCB's MCP */
 
 /* ------------------------------------------------------------------------
  * Notification badges on N_v (bound to the vCPU's kTCB).  Endpoint badges
@@ -270,9 +270,23 @@ struct l4h_event_page {
 	l4h_u64 host_cap;      /* written by the host: capacity left to this
 	                        * vCPU by other guests on its CPU and its SMT
 	                        * siblings, 128..=1024; 0: unknown (1024) */
-	l4h_u64 reserved[5];
+	l4h_u64 idle_since;    /* written by the guest: the time counter when
+	                        * the vCPU last blocked idle, 0 while it runs;
+	                        * idle_ticks is updated before it is cleared,
+	                        * so the host counts a block in progress as
+	                        * idle, not steal */
+	l4h_u64 io_flags;      /* written by the host on an HVM guest's vCPU 0:
+	                        * L4H_EVENT_IO_* */
+	l4h_u64 idle_seq;      /* written by the guest: a sequence count over
+	                        * idle_since and idle_ticks, odd while it
+	                        * changes them */
+	l4h_u64 reserved[2];
 	struct l4h_console_out console;
 };
+
+/* l4h_event_page.io_flags: an HVM guest's monitor does not busy-poll its
+ * devices' queues once they run dry. */
+#define L4H_EVENT_IO_NO_POLL    (1ull << 0)
 
 /* ------------------------------------------------------------------------
  * Boot info, mapped read-only at L4H_BOOTINFO_VA; the boot vCPU starts

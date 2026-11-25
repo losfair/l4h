@@ -250,6 +250,8 @@ struct VcpuState {
     run_us: u64,
     steal_ns: u64,
     started_accounting: bool,
+    /// SC_K's divisor beside an HVM vCPU (sched::kernel_divisors); 0: none.
+    kernel_divisor: u16,
     /// Host-published available capacity hint (0..=1024, like Linux hw_pressure / arch_scale_cpu_capacity)
     host_cap: u32,
 }
@@ -273,6 +275,9 @@ struct GuestState {
     vmm_next_wake: u64,
     /// Queue for work charged to SC_K (PV kernel or the entire HVM vCPU).
     sc_k_prio: usize,
+    /// An HVM guest (Sim::make_hvm): its vCPUs run on SC_K alone, at
+    /// PRIO_USER, and PV vCPUs beside them have SC_K limited.
+    hvm: bool,
     fairness_group: u8,
     effective_work: u128,
     window_work: u128,
@@ -387,8 +392,8 @@ impl Sim {
         let placements = self.place(nr_vcpus);
 
         let has_vmm = !matches!(vmm_pattern, VmmPattern::None);
-        let p0 = budget::plan(TIMESLICE_US, 0, cpu_cap_pct, 500, has_vmm.then_some(budget::VMM_SHARE_INIT));
-        let p_other = budget::plan(TIMESLICE_US, 0, cpu_cap_pct, 500, None);
+        let p0 = budget::plan(TIMESLICE_US, 0, cpu_cap_pct, 500, has_vmm.then_some(budget::VMM_SHARE_INIT), false);
+        let p_other = budget::plan(TIMESLICE_US, 0, cpu_cap_pct, 500, None, false);
 
         let mut vcpus = Vec::with_capacity(nr_vcpus);
         for (v, &(cpu, vcore)) in placements.iter().enumerate() {
@@ -405,6 +410,7 @@ impl Sim {
                 run_us: 0,
                 steal_ns: 0,
                 started_accounting: false,
+                kernel_divisor: 0,
                 host_cap: 1024,
             });
         }
@@ -438,6 +444,7 @@ impl Sim {
             vmm_runnable_until: 0,
             vmm_next_wake,
             sc_k_prio: PRIO_KERNEL as usize,
+            hvm: false,
             fairness_group,
             effective_work: 0,
             window_work: 0,
@@ -449,6 +456,16 @@ impl Sim {
             next_guest_balance: self.now + GUEST_BALANCE_US,
         };
         self.guests[id] = Some(g);
+        self.protect_vmms();
+    }
+
+    /// Guest `id` as an HVM guest: one thread per vCPU, on SC_K at
+    /// PRIO_USER (hvm::PRIO_VCPU) for guest kernel and user code alike.
+    fn make_hvm(&mut self, id: usize) {
+        let g = self.guests[id].as_mut().unwrap();
+        g.hvm = true;
+        g.sc_k_prio = (l4h_host::hvm::PRIO_VCPU - l4h_abi::PRIO_USER) as usize;
+        for t in &mut g.tasks { t.mode = TaskMode::Kernel; }
         self.protect_vmms();
     }
 
@@ -473,6 +490,63 @@ impl Sim {
         }
     }
 
+    /// The CPUs HVM vCPUs run on (sched::hvm_cpus).
+    fn hvm_cpus(&self) -> u64 {
+        let mut cpus = 0u64;
+        for g in self.guests.iter().flatten().filter(|g| g.active && g.hvm) {
+            for v in &g.vcpus { cpus |= 1u64 << v.core; }
+        }
+        cpus
+    }
+
+    /// sched::kernel_divisors: per CPU with an HVM vCPU, the PV kernels
+    /// there share half of it, a quarter where a VMM runs.  `moves`
+    /// (guest, vCPU, CPU) are counted at their destinations too.
+    fn kernel_divisors(&self, moves: &[(usize, usize, usize)]) -> [u16; MAX_CPUS] {
+        let hvm = self.hvm_cpus();
+        let mut pv = [0u16; MAX_CPUS];
+        let mut vmm = [false; MAX_CPUS];
+        for g in self.guests.iter().flatten().filter(|g| g.active) {
+            if !g.hvm {
+                for v in &g.vcpus { pv[v.core] += 1; }
+            }
+            if g.has_vmm { vmm[g.vmm_limits.unwrap().0] = true; }
+        }
+        for &(gid, v, dst) in moves {
+            let g = self.guests[gid].as_ref().unwrap();
+            if !g.hvm && g.vcpus[v].core != dst { pv[dst] += 1; }
+        }
+        let mut div = [0u16; MAX_CPUS];
+        for c in 0..MAX_CPUS {
+            if hvm & (1u64 << c) != 0 && pv[c] != 0 {
+                div[c] = pv[c] * if vmm[c] { 4 } else { 2 };
+            }
+        }
+        div
+    }
+
+    /// sched::limit_kernels: PV vCPUs whose contexts change are
+    /// reconfigured; vCPU 0 with a VMM is left to the VMM's plan below.
+    fn limit_kernels(&mut self) {
+        let div = self.kernel_divisors(&[]);
+        let now = self.now;
+        for g in self.guests.iter_mut().flatten().filter(|g| g.active && !g.hvm) {
+            for v in 0..g.vcpus.len() {
+                let want = div[g.vcpus[v].core];
+                if want == g.vcpus[v].kernel_divisor { continue; }
+                let before = vcpu_plan(g, v, g.vcpus[v].k_share, None);
+                g.vcpus[v].kernel_divisor = want;
+                if v == 0 && g.has_vmm { continue; }
+                let p = vcpu_plan(g, v, g.vcpus[v].k_share, None);
+                if (p.period, p.kernel, p.user, p.user_period)
+                    == (before.period, before.kernel, before.user, before.user_period) { continue; }
+                let core = g.vcpus[v].core;
+                g.vcpus[v].sc_k.configure(core, p.kernel, p.period, now, true);
+                g.vcpus[v].sc_u.configure(core, sc_u_budget(g.hvm, p), p.user_period, now, true);
+            }
+        }
+    }
+
     fn protect_vmms(&mut self) {
         let mut occupied = [0u64; MAX_CPUS];
         for g in self.guests.iter().flatten().filter(|g| g.active) {
@@ -488,17 +562,18 @@ impl Sim {
                 backgrounds[core] += 1;
             }
         }
+        self.limit_kernels();
         for g in self.guests.iter_mut().flatten().filter(|g| g.active && g.has_vmm) {
             let (core, old) = g.vmm_limits.unwrap();
-            let mut p = budget::plan(TIMESLICE_US, 0, g.cpu_cap_pct, g.vcpus[0].k_share, Some(g.vmm_share));
+            let mut p = vcpu_plan(g, 0, g.vcpus[0].k_share, Some(g.vmm_share));
             if g.vmm_limited {
                 p = budget::background(p, backgrounds[core]);
             }
             if p != old {
                 let v0_core = g.vcpus[0].core;
-                if (p.period, p.kernel, p.user) != (old.period, old.kernel, old.user) {
+                if (p.period, p.kernel, p.user, p.user_period) != (old.period, old.kernel, old.user, old.user_period) {
                     g.vcpus[0].sc_k.configure(v0_core, p.kernel, p.period, self.now, true);
-                    g.vcpus[0].sc_u.configure(v0_core, p.user, p.period, self.now, true);
+                    g.vcpus[0].sc_u.configure(v0_core, sc_u_budget(g.hvm, p), p.user_period, self.now, true);
                 }
                 if (p.vmm_period, p.vmm) != (old.vmm_period, old.vmm) {
                     let vmm_runnable = self.now < g.vmm_runnable_until;
@@ -1088,6 +1163,8 @@ impl Sim {
         let mut vmm_before = [None; MAX_GUESTS];
         let mut core_vmm = [0u64; MAX_CPUS];
         let mut largest = [0u64; MAX_CPUS];
+        let mut core_pvk = [0u64; MAX_CPUS];
+        let mut largest_boosted = [0u64; MAX_CPUS];
 
         let mut samples: Vec<policy::Sample> = Vec::new();
 
@@ -1099,6 +1176,9 @@ impl Sim {
                 let core = g.vmm_limits.unwrap().0;
                 core_vmm[core] += cv;
                 largest[core] = largest[core].max(cv);
+                if g.vmm_boosted {
+                    largest_boosted[core] = largest_boosted[core].max(cv);
+                }
             }
 
             g.cap_window_elapsed += elapsed_us;
@@ -1119,11 +1199,14 @@ impl Sim {
                 let old = if has_vmm {
                     g.vmm_limits.unwrap().1
                 } else {
-                    budget::plan(TIMESLICE_US, 0, g.cpu_cap_pct, g.vcpus[v].k_share, None)
+                    vcpu_plan(g, v, g.vcpus[v].k_share, None)
                 };
                 let ck = g.vcpus[v].sc_k.take_consumed();
                 let cu = g.vcpus[v].sc_u.take_consumed();
                 let c = ck + cu;
+                if !g.hvm {
+                    core_pvk[g.vcpus[v].core] += ck;
+                }
 
                 if g.cpu_cap_pct > 0 {
                     if let Some((ks, vs)) = budget::adapt(
@@ -1133,14 +1216,14 @@ impl Sim {
                         [ck, cu, if has_vmm { cv } else { 0 }],
                         elapsed_us,
                     ) {
-                        let mut next = budget::plan(TIMESLICE_US, 0, g.cpu_cap_pct, ks, has_vmm.then_some(vs));
+                        let mut next = vcpu_plan(g, v, ks, has_vmm.then_some(vs));
                         if has_vmm && g.vmm_limited {
                             next = budget::background(next, backgrounds[g.vmm_limits.unwrap().0]);
                         }
                         if budget::changed(old, next) {
                             let core = g.vcpus[v].core;
                             g.vcpus[v].sc_k.configure(core, next.kernel, next.period, self.now, true);
-                            g.vcpus[v].sc_u.configure(core, next.user, next.period, self.now, true);
+                            g.vcpus[v].sc_u.configure(core, sc_u_budget(g.hvm, next), next.user_period, self.now, true);
                             if has_vmm {
                                 let vc = g.vmm_limits.unwrap().0;
                                 g.vmm_sc.as_mut().unwrap().configure(vc, next.vmm, next.vmm_period, self.now, true);
@@ -1176,6 +1259,7 @@ impl Sim {
         }
 
         // Production BoostGuard
+        let hvm = self.hvm_cpus();
         let mut occupied = [0u64; MAX_CPUS];
         let mut guarded_vmms = [0usize; MAX_CPUS];
         for g in self.guests.iter().flatten().filter(|g| g.active) {
@@ -1192,21 +1276,22 @@ impl Sim {
                 || core == 0
                 || core_vmm[core].saturating_sub(vmm_used[g.id]) >= TIMESLICE_US
                 || guarded_vmms[core] > usize::from(!g.vmm_boosted);
-            let boosted = g.vmm_guard.boost(
-                g.vmm_boosted,
-                vmm_used[g.id],
-                core_vmm[core],
-                largest[core],
-                contended,
-                elapsed_us,
-                vmm_before[g.id].unwrap(),
-            );
+            let beside_hvm = hvm & (1u64 << core) != 0;
+            let crowd = core_vmm[core] + if beside_hvm { core_pvk[core] } else { 0 };
+            let largest = if beside_hvm { largest_boosted[core] } else { largest[core] };
+            let old = vmm_before[g.id].unwrap();
+            let boosted = if beside_hvm {
+                g.vmm_guard.boost_when(g.vmm_boosted, vmm_used[g.id], crowd, largest, contended, elapsed_us, old,
+                    budget::Crowded::BesideHvm)
+            } else {
+                g.vmm_guard.boost(g.vmm_boosted, vmm_used[g.id], crowd, largest, contended, elapsed_us, old)
+            };
             g.vmm_boosted = boosted;
         }
         self.protect_vmms();
 
         if self.strategy.balance && self.cpus >= 2 {
-            match policy::choose(&self.topology, &samples, elapsed_us) {
+            match policy::choose(&self.topology, &samples, elapsed_us, &core_vmm) {
                 Some(policy::Action::IntraCore { guest, vcpu, src, dst }) => {
                     assert_eq!(self.topology.core(src), self.topology.core(dst));
                     self.apply_single_move(guest, vcpu, dst, record);
@@ -1216,7 +1301,7 @@ impl Sim {
                     }
                 }
                 Some(policy::Action::VcoreSwap { guest, ps, pd }) => {
-                    self.apply_vcore_swap(guest, ps, pd, &samples, elapsed_us, record);
+                    self.apply_vcore_swap(guest, ps, pd, &samples, elapsed_us, &core_vmm, record);
                     if record {
                         self.migrations += 1;
                         self.vcore_swaps += 1;
@@ -1231,15 +1316,17 @@ impl Sim {
     }
 
     fn apply_single_move(&mut self, gid: usize, v: usize, dst: usize, record: bool) {
-        let Some(g) = self.guests[gid].as_mut() else { return };
-        if !g.active { return; }
+        if !self.guests[gid].as_ref().is_some_and(|g| g.active) { return; }
+        let div = self.kernel_divisors(&[(gid, v, dst)]);
+        let g = self.guests[gid].as_mut().unwrap();
+        g.vcpus[v].kernel_divisor = if g.hvm { 0 } else { div[dst] };
         let p = if v == 0 && g.has_vmm {
             g.vmm_limits.unwrap().1
         } else {
-            budget::plan(TIMESLICE_US, 0, g.cpu_cap_pct, g.vcpus[v].k_share, None)
+            vcpu_plan(g, v, g.vcpus[v].k_share, None)
         };
         g.vcpus[v].sc_k.configure(dst, p.kernel, p.period, self.now, true);
-        g.vcpus[v].sc_u.configure(dst, p.user, p.period, self.now, true);
+        g.vcpus[v].sc_u.configure(dst, sc_u_budget(g.hvm, p), p.user_period, self.now, true);
         g.vcpus[v].core = dst;
         g.vcpus[v].cooldown = COOLDOWN;
         if record {
@@ -1250,9 +1337,12 @@ impl Sim {
 
     /// sched::migrate of a VcoreSwap: the production moves.
     fn apply_vcore_swap(&mut self, gid: usize, ps: usize, pd: usize, samples: &[policy::Sample], elapsed_us: u64,
-        record: bool) {
+        vmm_load: &[u64; MAX_CPUS], record: bool) {
         let mut moves = Vec::new();
-        policy::swap_moves(&self.topology, samples, elapsed_us, gid, ps, pd, |v, dst| moves.push((v, dst)));
+        policy::swap_moves(&self.topology, samples, elapsed_us, vmm_load, gid, ps, pd, |v, dst| moves.push((v, dst)));
+        let all: Vec<_> = moves.iter().map(|&(v, dst)| (gid, v, dst)).collect();
+        if !self.guests[gid].as_ref().is_some_and(|g| g.active) { return; }
+        let div = self.kernel_divisors(&all);
         let Some(g) = self.guests[gid].as_mut() else { return };
         if !g.active { return; }
         let mut moved = vec![false; g.vcpus.len()];
@@ -1262,13 +1352,14 @@ impl Sim {
             let from = self.topology.core(g.vcpus[v].core);
             let to = self.topology.core(dst);
             assert!((from, to) == (ps, pd) || (from, to) == (pd, ps), "move {from} -> {to} outside {ps} <-> {pd}");
+            g.vcpus[v].kernel_divisor = if g.hvm { 0 } else { div[dst] };
             let p = if v == 0 && g.has_vmm {
                 g.vmm_limits.unwrap().1
             } else {
-                budget::plan(TIMESLICE_US, 0, g.cpu_cap_pct, g.vcpus[v].k_share, None)
+                vcpu_plan(g, v, g.vcpus[v].k_share, None)
             };
             g.vcpus[v].sc_k.configure(dst, p.kernel, p.period, self.now, true);
-            g.vcpus[v].sc_u.configure(dst, p.user, p.period, self.now, true);
+            g.vcpus[v].sc_u.configure(dst, sc_u_budget(g.hvm, p), p.user_period, self.now, true);
             g.vcpus[v].core = dst;
             g.vcpus[v].cooldown = COOLDOWN;
         }
@@ -1437,6 +1528,19 @@ impl Sim {
     }
 }
 
+/// SC_U's budget in `p`: an HVM vCPU has none (its plan's user part is 0),
+/// and its idle model SC_U keeps the whole period.
+fn sc_u_budget(hvm: bool, p: budget::Plan) -> u64 {
+    if hvm { p.user_period } else { p.user }
+}
+
+/// sched::plan_with: the vCPU's plan, its VMM's background limit applied
+/// by the caller, and SC_K's limit beside an HVM vCPU (budget::limit_kernel).
+fn vcpu_plan(g: &GuestState, v: usize, k_share: u32, vmm: Option<u32>) -> budget::Plan {
+    let p = budget::plan(TIMESLICE_US, 0, g.cpu_cap_pct, k_share, vmm, g.hvm);
+    budget::limit_kernel(p, u64::from(g.vcpus[v].kernel_divisor))
+}
+
 fn thread_guest(t: ThreadId) -> usize {
     match t {
         ThreadId::Vmm(g) | ThreadId::VcpuKernel(g, _) | ThreadId::VcpuUser(g, _) => g,
@@ -1482,10 +1586,8 @@ fn hvm_vcpu_shares_a_core_with_a_waking_pv_user() {
         sim.spawn_guest(id, 1, 0, VmmPattern::None, vec![task], 1);
     }
     sim.wake_tasks_and_vmms();
-    let hvm = sim.guests[0].as_mut().unwrap();
     // A single runnable HVM thread uses SC_K even for guest userspace.
-    hvm.tasks[0].mode = TaskMode::Kernel;
-    hvm.sc_k_prio = (l4h_host::hvm::PRIO_VCPU - l4h_abi::PRIO_USER) as usize;
+    sim.make_hvm(0);
 
     sim.run_until(3 * TIMESLICE_US);
     let pv = &sim.guests[1].as_ref().unwrap().tasks[0];
@@ -1493,6 +1595,145 @@ fn hvm_vcpu_shares_a_core_with_a_waking_pv_user() {
     assert!(pv.wakeup_latencies[0] <= TIMESLICE_US, "PV user waited {} us", pv.wakeup_latencies[0]);
     let hvm_cpu = &sim.guests[0].as_ref().unwrap().vcpus[0];
     assert!(hvm_cpu.sc_k.total_consumed > TIMESLICE_US, "HVM did not resume");
+}
+
+/// An HVM guest and `pv` PV guests whose kernels never stop (syscalls,
+/// interrupts, kernel threads, or a hostile kernel spinning), all hogs,
+/// all on CPU 0 of `cpus`: guest 0 is the HVM one.
+fn hvm_beside_busy_pv_kernels(strategy: Strategy, cpus: usize, pv: usize) -> Sim {
+    let ids: Vec<u32> = (0..cpus as u32).collect();
+    let mut sim = Sim::new(strategy, Topology::from_ids(&ids), 0, 0);
+    for id in 0..=pv {
+        sim.spawn_guest(id, 1, 0, VmmPattern::None, vec![make_task(TaskPattern::SteadyHog, 0, None, 0)], 1);
+        if sim.guests[id].as_ref().unwrap().vcpus[0].core != 0 {
+            sim.apply_single_move(id, 0, 0, false);
+        }
+    }
+    sim.wake_tasks_and_vmms();
+    for id in 1..=pv {
+        sim.guests[id].as_mut().unwrap().tasks[0].mode = TaskMode::Kernel;
+    }
+    sim.make_hvm(0);
+    sim
+}
+
+/// A PV kernel at PRIO_KERNEL, above the HVM vCPU's PRIO_USER, would keep
+/// it off a shared CPU for good with a full round-robin SC_K: beside an
+/// HVM vCPU, the PV kernels there share half the CPU
+/// (budget::limit_kernel), and the limit goes when the HVM guest does.
+#[test]
+fn a_busy_pv_kernel_leaves_a_shared_hvm_vcpu_its_part() {
+    let mut sim = hvm_beside_busy_pv_kernels(STATIC, 1, 1);
+    let pv = &sim.guests[1].as_ref().unwrap().vcpus[0];
+    assert_eq!(pv.kernel_divisor, 2);
+    let period = pv.sc_k.period;
+    assert_eq!(pv.sc_k.budget, period / 2);
+    assert_eq!((pv.sc_u.budget, pv.sc_u.period), (period, period), "SC_U keeps its full round-robin budget");
+    let run = 2_000_000;
+    sim.run_until(run);
+    let hvm = sim.guests[0].as_ref().unwrap().vcpus[0].sc_k.total_consumed;
+    let pv = sim.guests[1].as_ref().unwrap().vcpus[0].sc_k.total_consumed;
+    assert!(hvm * 100 >= run * 40, "HVM vCPU got {hvm} us of {run}");
+    assert!(pv * 100 >= run * 40, "PV kernel got {pv} us of {run}");
+    // The HVM guest gone, the PV kernel's SC_K is whole again.
+    sim.destroy_guest(0);
+    let pv = &sim.guests[1].as_ref().unwrap().vcpus[0];
+    assert_eq!(pv.kernel_divisor, 0);
+    assert_eq!(pv.sc_k.budget, pv.sc_k.period);
+}
+
+/// Two busy PV kernels beside one HVM vCPU share the half between them:
+/// each alone at half would leave the HVM vCPU nothing.
+#[test]
+fn busy_pv_kernels_share_half_a_cpu_beside_an_hvm_vcpu() {
+    let mut sim = hvm_beside_busy_pv_kernels(STATIC, 1, 2);
+    for id in 1..=2 {
+        let pv = &sim.guests[id].as_ref().unwrap().vcpus[0];
+        assert_eq!((pv.kernel_divisor, pv.sc_k.budget), (4, pv.sc_k.period / 4));
+    }
+    let run = 2_000_000;
+    sim.run_until(run / 2);
+    let half = sim.guests[0].as_ref().unwrap().vcpus[0].sc_k.total_consumed;
+    sim.run_until(run);
+    let hvm = sim.guests[0].as_ref().unwrap().vcpus[0].sc_k.total_consumed;
+    assert!(hvm * 100 >= run * 40, "HVM vCPU got {hvm} us of {run}");
+    assert!((hvm - half) * 100 >= run / 2 * 40, "and keeps progressing: {} us of the last {}", hvm - half, run / 2);
+    for id in 1..=2 {
+        let pv = sim.guests[id].as_ref().unwrap().vcpus[0].sc_k.total_consumed;
+        assert!(pv * 100 >= run * 20, "PV kernel {id} got {pv} us of {run}");
+    }
+}
+
+/// A PV guest whose VMM is busy with I/O (boosted, at PRIO_VMM) and whose
+/// kernel never stops, beside an HVM vCPU on one CPU: with a VMM there,
+/// the PV kernel gets a quarter, and a VMM that with it takes more than
+/// three quarters of the CPU is demoted to its background half, so
+/// PRIO_USER (here the HVM vCPU alone) keeps a quarter in the steady state
+/// whatever the VMM's load (at exactly half, the VMM keeps its boost and
+/// the quarter is what is left).
+#[test]
+fn a_busy_vmm_and_pv_kernel_leave_a_shared_hvm_vcpu_a_quarter() {
+    for (burst, demoted) in [(2_500, None), (2_600, Some(true)), (2_700, Some(true)), (2_740, Some(true)),
+        (2_750, Some(true)), (3_500, Some(true)), (5_000, Some(true))] {
+        let mut sim = Sim::new(STATIC, Topology::from_ids(&[0]), 0, 0);
+        sim.spawn_guest(0, 1, 0, VmmPattern::None, vec![make_task(TaskPattern::SteadyHog, 0, None, 0)], 1);
+        sim.spawn_guest(1, 1, 0, VmmPattern::HonestIo { burst_us: burst, period_us: 5_000 },
+            vec![make_task(TaskPattern::SteadyHog, 0, None, 0)], 1);
+        sim.wake_tasks_and_vmms();
+        sim.guests[1].as_mut().unwrap().tasks[0].mode = TaskMode::Kernel;
+        sim.make_hvm(0);
+        assert_eq!(sim.guests[1].as_ref().unwrap().vcpus[0].kernel_divisor, 4, "a VMM there: a quarter");
+        let run = 4_000_000;
+        sim.run_until(run / 2);
+        let half = sim.guests[0].as_ref().unwrap().vcpus[0].sc_k.total_consumed;
+        sim.run_until(run);
+        let g = sim.guests[1].as_ref().unwrap();
+        if let Some(demoted) = demoted {
+            assert_eq!(!g.vmm_boosted, demoted, "VMM busy {burst} of 5000 us");
+        }
+        let hvm = sim.guests[0].as_ref().unwrap().vcpus[0].sc_k.total_consumed - half;
+        assert!(hvm * 100 >= run / 2 * 24, "VMM busy {burst} of 5000 us: HVM vCPU got {hvm} us of the last {}", run / 2);
+    }
+}
+
+/// Two VMMs beside an HVM vCPU, the busier demoted first and still using
+/// its background part: the other, boosted, is then the largest boosted
+/// one and is demoted in turn when they crowd the CPU, so the HVM vCPU
+/// keeps its part (a demoted VMM using more must not shield it).
+#[test]
+fn a_demoted_vmm_does_not_shield_a_boosted_one_beside_an_hvm_vcpu() {
+    let mut sim = Sim::new(STATIC, Topology::from_ids(&[0]), 0, 0);
+    sim.spawn_guest(0, 1, 0, VmmPattern::None, vec![make_task(TaskPattern::SteadyHog, 0, None, 0)], 1);
+    sim.spawn_guest(1, 1, 0, VmmPattern::HonestIo { burst_us: 5_000, period_us: 5_000 }, vec![], 1);
+    sim.spawn_guest(2, 1, 0, VmmPattern::HonestIo { burst_us: 1_750, period_us: 5_000 },
+        vec![make_task(TaskPattern::SteadyHog, 0, None, 0)], 1);
+    sim.wake_tasks_and_vmms();
+    sim.guests[2].as_mut().unwrap().tasks[0].mode = TaskMode::Kernel;
+    sim.make_hvm(0);
+    let run = 4_000_000;
+    sim.run_until(run / 2);
+    let half = sim.guests[0].as_ref().unwrap().vcpus[0].sc_k.total_consumed;
+    sim.run_until(run);
+    assert!(!sim.guests[1].as_ref().unwrap().vmm_boosted, "the spinning VMM demoted");
+    assert!(!sim.guests[2].as_ref().unwrap().vmm_boosted, "and the 35% one after it");
+    let hvm = sim.guests[0].as_ref().unwrap().vcpus[0].sc_k.total_consumed - half;
+    assert!(hvm * 100 >= run / 2 * 24, "HVM vCPU got {hvm} us of the last {}", run / 2);
+}
+
+/// The limited PV kernel leaves the HVM vCPU enough to count as busy: with
+/// a free CPU, the balancer spreads them, and each gets a whole CPU.
+#[test]
+fn a_busy_pv_kernel_and_an_hvm_vcpu_are_spread_by_the_balancer() {
+    let mut sim = hvm_beside_busy_pv_kernels(Strategy { balance: true, guest: GuestModel::Cap }, 2, 1);
+    // Past the placement's cooldown (COOLDOWN balancer periods).
+    sim.run_until(2_000_000);
+    let (hvm, pv) = (sim.guests[0].as_ref().unwrap(), sim.guests[1].as_ref().unwrap());
+    assert_ne!(hvm.vcpus[0].core, pv.vcpus[0].core, "not spread");
+    assert_eq!(pv.vcpus[0].kernel_divisor, 0);
+    let before = hvm.vcpus[0].sc_k.total_consumed;
+    sim.run_until(3_000_000);
+    let got = sim.guests[0].as_ref().unwrap().vcpus[0].sc_k.total_consumed - before;
+    assert!(got * 100 >= 1_000_000 * 95, "HVM vCPU alone got {got} us of 1 s");
 }
 
 // ---- Scenarios ----

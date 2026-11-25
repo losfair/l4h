@@ -9,7 +9,7 @@
 use core::sync::atomic::Ordering;
 
 use l4h_abi as abi;
-use l4h_rt::host::{self, hvm as hv};
+use l4h_rt::host::hvm as hv;
 use hv::arm;
 
 use super::hw::{Exit, Hw};
@@ -176,13 +176,13 @@ impl<H: Hw> Vcpu<H> {
             self.armed = d;
             crate::sys::vcpu_timer(self.id, d);
         }
+        // Idle: the time blocked, and a block in progress when vmmgr
+        // samples (EventPage::idle_since).
+        let page = crate::sys::event_page(self.id);
         let before = vm::now();
+        unsafe { crate::sync::idle_begin(page, before) };
         crate::sys::wait(self.id);
-        let page = host::vmm_event_page_va(self.id) as *mut abi::EventPage;
-        unsafe {
-            let p = core::ptr::addr_of_mut!((*page).idle_ticks);
-            p.write_volatile(p.read_volatile().wrapping_add(vm::now().saturating_sub(before)));
-        }
+        unsafe { crate::sync::idle_end(page, vm::now().saturating_sub(before)) };
     }
 
     fn fatal(&mut self, what: &str, why: u64) -> ! {

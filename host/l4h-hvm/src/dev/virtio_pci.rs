@@ -99,6 +99,11 @@ pub trait Backend {
     fn more(&self) -> u64 {
         0
     }
+    /// Queues that ran dry and are polled on rather than notified: work
+    /// that may come, which the I/O thread spins for (io::polling).
+    fn polling(&self) -> u64 {
+        0
+    }
     /// Whether it may have work, from memory alone: the I/O thread spins
     /// on it while devices poll (`more`), between its turns.  Those that
     /// cannot tell say no, and are served at the next turn.

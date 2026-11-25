@@ -351,16 +351,10 @@ impl Hw for Svm {
     }
 
     fn skip(&mut self, len: u64) {
-        let rip = self.rip.wrapping_add(len);
-        // Only outside 64-bit mode does RIP wrap at 4 GiB, and that needs
-        // CS (a VMCB read) only when a RIP below 4 GiB passes it with
-        // EFER.LMA set: above it is 64-bit code, below it nothing wraps.
-        let wraps = if self.rd(EFER) & walk::EFER_LMA == 0 {
-            true
-        } else {
-            self.rip <= 0xffff_ffff && rip > 0xffff_ffff && self.mode() != Mode::Bits64
-        };
-        self.rip = if wraps { rip & 0xffff_ffff } else { rip };
+        // Only outside 64-bit mode does RIP wrap at 4 GiB, and the mode
+        // (VMCB reads) matters only when RIP crosses it (exits::skip_rip).
+        let rip = self.rip;
+        self.rip = exits::skip_rip(rip, len, || self.mode() == Mode::Bits64);
         if self.int_state & 1 != 0 {
             self.int_state = 0;
             self.wr(INT_STATE, 0);

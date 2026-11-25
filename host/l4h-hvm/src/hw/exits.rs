@@ -5,6 +5,18 @@
 use super::{Event, Exit};
 use crate::x86::decode::Seg;
 
+// ---- Both.
+
+/// RIP after an exit's instruction of `len` bytes at `rip`: wrapped at
+/// 4 GiB outside 64-bit mode.  `bits64` (the guest's mode, which costs
+/// VMCS or VMCB reads, each a system call) is asked only when the step
+/// crosses 4 GiB from below: a RIP above 4 GiB is 64-bit code (VM entry
+/// requires bits 63:32 clear outside it), and below it nothing wraps.
+pub fn skip_rip(rip: u64, len: u64, bits64: impl FnOnce() -> bool) -> u64 {
+    let next = rip.wrapping_add(len);
+    if rip <= 0xffff_ffff && next > 0xffff_ffff && !bits64() { next & 0xffff_ffff } else { next }
+}
+
 // ---- VT-x.
 
 pub const VMX_INTR_VALID: u64 = 1 << 31;
@@ -279,6 +291,31 @@ pub fn svm_db_is_ours(guest_tf: bool, dr6: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skip_rip_asks_the_mode_only_across_4_gib() {
+        let asked = core::cell::Cell::new(0);
+        let mode = |bits64: bool| {
+            let asked = &asked;
+            move || {
+                asked.set(asked.get() + 1);
+                bits64
+            }
+        };
+        // 64-bit code high in the address space: no question, no wrap.
+        assert_eq!(skip_rip(0xffff_ffff_8100_0000, 2, mode(true)), 0xffff_ffff_8100_0002);
+        // Low code (32-bit, or 64-bit below 4 GiB): no question either.
+        assert_eq!(skip_rip(0x10_0000, 3, mode(false)), 0x10_0003);
+        assert_eq!(skip_rip(0xffff_fff0, 0xf, mode(false)), 0xffff_ffff, "up to the last byte below 4 GiB");
+        assert_eq!(asked.get(), 0, "no VMCS read for the common exits");
+        // Across 4 GiB: 32-bit code wraps, 64-bit code goes on.
+        assert_eq!(skip_rip(0xffff_fffe, 3, mode(false)), 1);
+        assert_eq!(skip_rip(0xffff_fffe, 3, mode(true)), 0x1_0000_0001);
+        assert_eq!(asked.get(), 2);
+        // The top of the 64-bit space wraps as the CPU's RIP does.
+        assert_eq!(skip_rip(u64::MAX, 2, mode(true)), 1);
+        assert_eq!(asked.get(), 2);
+    }
 
     #[test]
     fn vmx_owns_pe_and_pg_and_steps_over_instructions_only() {

@@ -1250,6 +1250,25 @@ create fails with `-ENODEV`. `l4hctl list` shows them as `hvm`.
   (the I/O APIC, the UART, the PIT and RTC); the I/O thread never spins
   behind a lower-priority vCPU, and leaves I/O APIC and UART work it
   causes to vCPU 0 (it signals it).
+- **Polling.** A halted vCPU polls for what would wake it for an adaptive
+  window before it blocks, as the PV idle loop does (`arch/l4h/kernel/time.c`):
+  none at first, an eighth of 100 µs after a halt that a poll would have
+  caught, doubling up to 100 µs, none again after a longer one; and none
+  while its `host_cap` says other guests use its CPU or its SMT siblings,
+  where the poll would take their time at the vCPU's priority. Around each
+  block it sets `idle_since` in its event page, then adds the block to
+  `idle_ticks` and clears it, both under `idle_seq`, so a block still in progress at a
+  balancer sample counts as idle, not steal (§7.4). The window follows the
+  whole wait, the poll that missed included. After a batch the
+  I/O thread takes the work left at once; a network queue that ran dry is
+  polled, notifications off, for `NET_POLL_US` (spinning on the queues
+  alone between turns, no `seL4_Yield`, which would give up the rest of a
+  limited SC's refill and lets no lower priority run anyway) only while
+  vmmgr allows it: `L4H_EVENT_IO_NO_POLL` in vCPU 0's `io_flags` turns it
+  off while the guest is capped, the monitor's boost is withdrawn (guarded
+  or not), or
+  another guest's vCPUs share the monitor's core, and the queue then asks
+  for notifications again.
 - **Memory.** RAM below the 32-bit hole, `[0, min(ram, 3 GiB))`, the rest
   from 4 GiB; the hole holds the PCI MMIO window (`0xC000_0000`, 512 MiB),
   ECAM (`0xE000_0000`, 1 MiB), the I/O APIC and the local APICs, none of
@@ -1306,10 +1325,18 @@ create fails with `-ENODEV`. `l4hctl list` shows them as `hvm`.
   calibrates the TSC against the PIT or the PM timer, which fails when
   an exit takes longer than about 10 µs, as nested ones do.
   So the hypervisor leaves carry KVM's signature with **kvmclock**
-  (`KVM_FEATURE_CLOCKSOURCE2` and the stable bit) and `KVM_FEATURE_PV_EOI`
+  (`KVM_FEATURE_CLOCKSOURCE2` and the stable bit), `KVM_FEATURE_PV_EOI`
   (an entry with one edge-triggered interrupt in service and none
   requested sets a flag in the guest's word, and the guest's EOI clears it
-  instead of an x2APIC write that would exit), and no other KVM feature,
+  instead of an x2APIC write that would exit) and `KVM_FEATURE_STEAL_TIME`
+  (`MSR_KVM_STEAL_TIME`: before an entry, when vmmgr's `steal_ns` for the
+  vCPU grew, what it grew by is added to the `steal` of its
+  `struct kvm_steal_time`, under a version written odd first as pvclock's.
+  As KVM's, the structure's own `steal` and version go on: a fresh one
+  counts from 0, one named again (or the one in use) never goes back,
+  which the guest's unsigned `steal - prev_steal_time` would take for a
+  huge steal; INIT turns it off, as it does PV EOI. `preempted` stays 0),
+  and no other KVM feature,
   which every distribution kernel uses (`CONFIG_KVM_GUEST`): a vCPU's
   `pvclock_vcpu_time_info` is written once, where the guest names it
   (`MSR_KVM_SYSTEM_TIME_NEW`), with the host TSC's rate, kvmclock time 0
@@ -1577,14 +1604,15 @@ Global on each core, with `P_K` = `PRIO_KERNEL` = 100:
 | `P_K + 3` | boosted l4h-vmm instances; l4h-trustd (last core, at most 5 ms per 20 ms) |
 | `P_K + 2` | l4h-logd (core 0, at most 1 ms per 5 ms), strictly above throttled VMMs |
 | `P_K + 1` | VMMs whose boost was withdrawn; their budgets are limited while other running guests have vCPUs assigned to their core, including blocked vCPUs |
-| `P_K` | PV guest kernel TCBs (`SC_K`) |
+| `P_K` | PV guest kernel TCBs (`SC_K`; their MCP is `P_U`) |
 | `P_U` = 99 | PV guest user TCBs (`SC_U`) and HVM vCPUs (`SC_K`) |
 
 Boosted, uncapped VMMs have full round-robin scheduling contexts. At each
 100 ms sample, vmmgr withdraws the boost only if VMMs consumed at least
 80% of wall time on their core and the host detects potential contention.
 Only the largest consumer, including ties, loses
-its boost. Idle VMMs do not change that selection, so a spinner using
+its boost; on a CPU with an HVM vCPU, the largest of those still boosted
+(a demoted one using its background half does not shield the next, §7.1 below). Idle VMMs do not change that selection, so a spinner using
 60% does not demote an I/O neighbour using 40% merely because six other
 VMMs are idle.
 
@@ -1628,7 +1656,7 @@ can use a full scheduling context even during boost backoff. The manager
 installs protection before starting a guest or moving a vCPU onto the
 core, retains it on the source until a move commits, and reconciles it
 after the move. Stopping a core's last other guest releases its reservation at
-the next balance. Explicit guest caps still apply. Limited periods grow
+once, after it is stopped. Explicit guest caps still apply. Limited periods grow
 if necessary to keep every SC above 200 µs. Boosted VMMs do not divide
 this allowance.
 
@@ -1670,8 +1698,36 @@ the VMM. A CPU cap charges the VMM's hypercalls, virtio queues, display
 and console work against vCPU 0's budget (§7.2).
 Other host services run with full budgets unless listed above.
 memd charges hotplug to the guest's token bucket (§8.5). Because
-`P_K > P_U` for every guest, one guest's kernel work can briefly preempt
-another guest's user work, bounded by `SC_K` budgets.
+`P_K > P_U` for every guest, one guest's kernel work can preempt another
+guest's user work, which HVM vCPUs run all of at `P_U`. A PV guest holds
+its kTCB as the authority for its user TCBs: the kTCB runs at `P_K` but
+its MCP is `P_U`, so a guest kernel cannot raise its own user threads to
+`P_K` (seL4 checks a new priority against the authority's MCP, not the
+target's). An uncapped `SC_K` is a full round-robin context, which a busy
+or hostile guest kernel would never leave to an HVM vCPU on its CPU; so
+on a CPU where an HVM guest's vCPU runs (or is about to: protection comes
+before its start or a move), the PV kernels there share half of it: each
+of the `n` running (or starting) PV vCPUs' `SC_K` gets at most `1/2n` of
+its period, or `1/4n` where a VMM runs or is about to start (above both:
+a guarded one has at most half the CPU; there the CPU is crowded when
+VMMs and these kernels together use more than three quarters of it, not
+VMMs alone 80% as elsewhere, and the largest boosted VMM is then demoted
+to its background half by the next 100 ms sample), so `P_U`, the HVM
+vCPU and the PV users there in round robin, keeps at least a quarter in
+the steady state (`sched::kernel_divisors`,
+`budget::limit_kernel`; a period too short for 200 µs per part grows for
+`SC_K` and a capped `SC_U`, an uncapped `SC_U` keeping its timeslice). An
+uncapped `SC_U` keeps its full budget, a capped one gets what `SC_K` gives
+up, so the cap holds. Only vCPUs whose contexts change are reconfigured
+(a low cap already within the limit keeps its refills); a PV vCPU moved
+there is counted there before it moves and configured limited for its
+destination; a guest stopping or destroyed brings the survivors' limits
+in line at once (`sched::reconcile`). The balancer
+counts what VMMs and HVM monitors use of a CPU as load there, and from
+25% of it as one busy thread that does not move; a vCPU's fair share is
+of what the VMMs leave: a vCPU a busy monitor holds down (24% beside a
+monitor at 76%) still counts as busy and leaves for a free CPU, and no
+busy vCPU is brought to it.
 
 ### 7.2 Budgets and CPU caps
 
@@ -1687,7 +1743,9 @@ another guest's user work, bounded by `SC_K` budgets.
   cap times the number of vCPUs.
   - Each SC needs at least 200 µs. Below 12%, vCPU 0's three SCs need a
     longer period (600 µs every 60 ms at 1%); other vCPUs' two SCs need
-    one below 8% (400 µs every 40 ms at 1%). AArch64 capped vCPUs use
+    one below 8% (400 µs every 40 ms at 1%). An HVM vCPU has only `SC_K`,
+    which gets the guest's whole part: one SC fewer to reserve for, and
+    its saturation is judged against that part alone. AArch64 capped vCPUs use
     at least a 40 ms period to amortize emulated GIC timer delivery.
   - The split adapts: when, in a balancer period, any SC used at least
     90% of its part, the budget is split in proportion to what each used
@@ -1823,9 +1881,23 @@ The guest accumulates its idle time in the event page (`idle_ticks`),
 including the time its vCPUs block waiting for a spinlock (§6). Each
 balancer period vmmgr computes, per vCPU, `steal = wall − consumed − idle`
 from the vCPU's first run and publishes it monotonically as `steal_ns`.
+A block still in progress at the sample is idle too: whoever runs the
+vCPU (the PV guest kernel, or an HVM guest's monitor) sets `idle_since`
+when it blocks, and adds the block to `idle_ticks` and clears it when it
+ends, each change under `idle_seq`, a sequence count that is odd while it
+lasts. vmmgr reads both between equal even counts and adds
+`now − idle_since`; a sample that keeps finding them changing leaves
+steal as it was rather than raise it from a torn read (a guest that never
+sets them is counted as before). This is still an estimate from wall
+time: a `seL4_Wait` includes the tail from its wakeup to running again;
+exact run delay would need the kernel's accounting. An HVM vCPU's calls
+to its monitor's I/O thread (device accesses it cannot take itself, RAM
+it maps) block it as a wait does and count as idle the same way; the
+`MSR_KVM_STEAL_TIME` steal an HVM guest sees is this `steal_ns`.
 The guest returns it as Linux's paravirt steal clock
 (`CONFIG_PARAVIRT_TIME_ACCOUNTING`), so it shows as `st` in /proc/stat and
-top: a guest capped at 25% sees about 75% steal (`tests/run-m6test.sh`).
+top: a guest capped at 25% sees about 75% steal (`tests/run-m6test.sh`);
+an HVM guest reads it through `MSR_KVM_STEAL_TIME` (§5.11).
 `l4hctl top` and the host dashboard show each VM's CPU use over the last
 period, including its VMM's consumption.
 
@@ -2211,8 +2283,8 @@ grow and shrink without going through `l4h-root`.
   and stay in use there (`MemdLink::free`, which also empties an exchange
   slot before it puts a block in it), and a boot block it
   cannot copy fails the guest's load.
-- **Scheduling.** memd runs on core 0 at `PRIO_KERNEL + 3`, above every
-  guest, with a full budget: root waits for it.
+- **Scheduling.** memd runs on core 0 at `PRIO_SERVICE` (`PRIO_KERNEL + 4`),
+  above every guest, with a full budget: root waits for it.
 - **Limits.** Only the table: its size follows the host's memory, and no
   request makes memd use more of anything. A 1 TiB host needs 12 MiB of
   table and 64 MiB of CNode.

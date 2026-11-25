@@ -11,9 +11,16 @@ pub const MSR_SYSTEM_TIME: u32 = 0x4b56_4d01;
 /// MSR_KVM_PV_EOI_EN: bit 0 on, the rest a 4-byte aligned address of the
 /// guest's PV EOI word (Vcpu::pv_eoi_*).
 pub const MSR_PV_EOI: u32 = 0x4b56_4d04;
-/// CPUID 0x40000001 EAX: KVM_FEATURE_CLOCKSOURCE2, KVM_FEATURE_PV_EOI and
-/// KVM_FEATURE_CLOCKSOURCE_STABLE_BIT.
-pub const FEATURES: u32 = (1 << 3) | (1 << 6) | (1 << 24);
+/// MSR_KVM_STEAL_TIME: bit 0 on, bits 5:1 reserved (#GP), the rest the
+/// 64-byte aligned address of the vCPU's struct kvm_steal_time.
+pub const MSR_STEAL_TIME: u32 = 0x4b56_4d03;
+pub const STEAL_TIME_ENABLE: u64 = 1;
+pub const STEAL_TIME_RESERVED: u64 = 0x3e;
+/// CPUID 0x40000001 EAX: KVM_FEATURE_CLOCKSOURCE2, KVM_FEATURE_STEAL_TIME,
+/// KVM_FEATURE_PV_EOI and KVM_FEATURE_CLOCKSOURCE_STABLE_BIT.
+pub const FEATURES: u32 = (1 << 3) | (1 << 5) | (1 << 6) | (1 << 24);
+/// The size of struct kvm_steal_time.
+pub const STEAL_TIME_SIZE: usize = 64;
 /// pvclock_vcpu_time_info.flags: PVCLOCK_TSC_STABLE_BIT.
 pub const TSC_STABLE: u8 = 1;
 /// The size of pvclock_vcpu_time_info and of pvclock_wall_clock.
@@ -94,6 +101,35 @@ pub fn publish(b: &[u8], mut version: impl FnMut(u32), mut body: impl FnMut(&[u8
     version(v);
 }
 
+/// struct kvm_steal_time: `steal` (ns the vCPU was runnable and not
+/// running, cumulative since the guest named it), then `version` at 8, as
+/// pvclock's even when stable, `flags` 0 and `preempted` 0 (the
+/// preempted hint is not offered: KVM_FEATURE_PV_TLB_FLUSH and the like
+/// are not in FEATURES).
+pub fn steal_time(version: u32, steal: u64) -> [u8; STEAL_TIME_SIZE] {
+    let mut b = [0; STEAL_TIME_SIZE];
+    b[0..8].copy_from_slice(&steal.to_le_bytes());
+    b[8..12].copy_from_slice(&version.to_le_bytes());
+    b
+}
+
+/// Write a kvm_steal_time `b`, for its even version `v` (`b[8..12]`), as
+/// KVM's record_steal_time does: `v - 1` first, then the rest, then `v`.
+/// Linux's kvm_steal_clock() retries while the version is odd or changed,
+/// so it never takes a `steal` from the middle of a write.  `write(off,
+/// bytes)` stores at that offset of the structure; the version is one
+/// aligned 32-bit store.
+pub fn publish_steal(b: &[u8; STEAL_TIME_SIZE], mut write: impl FnMut(usize, &[u8])) {
+    let v = u32::from_le_bytes([b[8], b[9], b[10], b[11]]);
+    debug_assert!(v & 1 == 0);
+    write(8, &v.wrapping_sub(1).to_le_bytes());
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    write(0, &b[0..8]);
+    write(12, &b[12..]);
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    write(8, &b[8..12]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,6 +178,19 @@ mod tests {
         for begin in [2u32, 3] {
             assert_ne!(begin & !1, 4, "a reader from before retries");
         }
+        // kvm_steal_time: steal at 0, the version at 8, v - 1 first.
+        let st = steal_time(6, 0x0102_0304_0506_0708);
+        assert_eq!(&st[0..8], &0x0102_0304_0506_0708u64.to_le_bytes());
+        assert_eq!(&st[8..12], &6u32.to_le_bytes());
+        assert!(st[12..].iter().all(|&b| b == 0), "flags and preempted clear");
+        let mem = core::cell::RefCell::new([0xffu8; STEAL_TIME_SIZE]);
+        let order = core::cell::RefCell::new(std::vec::Vec::new());
+        publish_steal(&st, |off, b| {
+            mem.borrow_mut()[off..off + b.len()].copy_from_slice(b);
+            order.borrow_mut().push((off, b.len(), u32::from_le_bytes(mem.borrow()[8..12].try_into().unwrap())));
+        });
+        assert_eq!(*order.borrow(), [(8, 4, 5), (0, 8, 5), (12, 52, 5), (8, 4, 6)], "odd while the body changes");
+        assert_eq!(*mem.borrow(), st);
         // Across the wrap: 0 - 1 is odd, and its & !1 is not 0.
         assert_eq!(0u32.wrapping_sub(1) & 1, 1);
         assert_ne!(0u32.wrapping_sub(1) & !1, 0);

@@ -75,6 +75,17 @@ pub mod sys {
     pub fn wait(_v: usize) {
         WAITS.fetch_add(1, Ordering::SeqCst);
     }
+    /// The vCPUs' event pages (vmmgr's, mapped in l4h-hvm): zeroed, as
+    /// vmmgr makes them.
+    #[repr(C, align(4096))]
+    pub struct Page(pub [u8; 4096]);
+    pub static mut PAGES: [Page; 4] = [const { Page([0; 4096]) }; 4];
+    pub fn event_page(v: usize) -> *mut l4h_abi::EventPage {
+        unsafe { core::ptr::addr_of_mut!(PAGES[v]) as *mut l4h_abi::EventPage }
+    }
+    pub fn io_flags() -> u64 {
+        unsafe { core::ptr::addr_of!((*event_page(0)).io_flags).read_volatile() }
+    }
     pub fn vcpu_timer(v: usize, deadline: u64) {
         VCPU_TIMERS[v].store(deadline, Ordering::SeqCst);
     }

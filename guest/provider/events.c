@@ -93,6 +93,46 @@ int l4h_collect_events(int *timer, unsigned long *ipi, unsigned long *events)
 	return any;
 }
 
+/*
+ * The host's steal estimate (wall - run - idle) samples idle_ticks every
+ * 100 ms: a block still in progress at a sample would count as steal,
+ * which is published monotonically.  idle_since says one is in progress
+ * (0: none).  Both change under idle_seq, a sequence count that is odd
+ * while they do, so the host reads them from one moment (it retries
+ * across a change, or leaves steal alone for that sample).  Only this
+ * vCPU writes them.
+ */
+static void l4h_idle_write_begin(struct l4h_event_page *e)
+{
+	__atomic_store_n(&e->idle_seq, e->idle_seq + 1, __ATOMIC_RELAXED);
+	__atomic_thread_fence(__ATOMIC_RELEASE);
+}
+
+static void l4h_idle_write_end(struct l4h_event_page *e)
+{
+	__atomic_store_n(&e->idle_seq, e->idle_seq + 1, __ATOMIC_RELEASE);
+}
+
+static void l4h_idle_begin(struct l4h_vcpu *v, unsigned long long t0)
+{
+	struct l4h_event_page *e = v->evt;
+
+	l4h_idle_write_begin(e);
+	__atomic_store_n(&e->idle_since, t0 ? t0 : 1, __ATOMIC_RELAXED);
+	l4h_idle_write_end(e);
+}
+
+static void l4h_idle_end(struct l4h_vcpu *v, unsigned long long t0)
+{
+	struct l4h_event_page *e = v->evt;
+	unsigned long long blocked = l4h_rdtsc() - t0;
+
+	l4h_idle_write_begin(e);
+	__atomic_store_n(&e->idle_ticks, e->idle_ticks + blocked, __ATOMIC_RELAXED);
+	__atomic_store_n(&e->idle_since, 0, __ATOMIC_RELAXED);
+	l4h_idle_write_end(e);
+}
+
 void l4h_idle_wait(void)
 {
 	struct l4h_vcpu *v = l4h_this_vcpu();
@@ -104,9 +144,10 @@ void l4h_idle_wait(void)
 	 * notification active, so the wait returns immediately: no lost
 	 * wakeups. */
 	unsigned long long t0 = l4h_rdtsc();
+	l4h_idle_begin(v, t0);
 	seL4_Wait(v->ntfn, &badge);
 	/* Published for the host's steal-time estimate (only we write it). */
-	__atomic_store_n(&v->evt->idle_ticks, v->evt->idle_ticks + (l4h_rdtsc() - t0), __ATOMIC_RELAXED);
+	l4h_idle_end(v, t0);
 	__atomic_or_fetch(&v->ntfn_pending, badge, __ATOMIC_RELEASE);
 }
 
@@ -255,9 +296,10 @@ void l4h_pv_wait(const unsigned char *ptr, unsigned char val)
 	 * waits, also one that a signal already there ends at once. */
 	__atomic_store_n(&v->pv_waits, v->pv_waits + 1, __ATOMIC_RELAXED);
 	t0 = l4h_rdtsc();
+	l4h_idle_begin(v, t0);
 	seL4_Wait(v->ntfn, &badge);
 	/* Blocked, not runnable: not steal time (see l4h_idle_wait()). */
-	__atomic_store_n(&v->evt->idle_ticks, v->evt->idle_ticks + (l4h_rdtsc() - t0), __ATOMIC_RELAXED);
+	l4h_idle_end(v, t0);
 	__atomic_or_fetch(&v->ntfn_pending, badge, __ATOMIC_RELEASE);
 	l4h_poll_events();
 }

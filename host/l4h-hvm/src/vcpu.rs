@@ -10,7 +10,7 @@
 use core::sync::atomic::Ordering;
 
 use l4h_abi as abi;
-use l4h_rt::host::{self, hvm as hv};
+use l4h_rt::host::hvm as hv;
 
 use crate::dev::apic::{PENDING_INIT, PENDING_NMI, PENDING_SIPI};
 use crate::dev::lapic::{self, Lapic};
@@ -48,8 +48,28 @@ pub fn with_addr(old: u64, v: u64, addr: u8) -> u64 {
 struct Span {
     parts: [(u64, u64); 2],
 }
-/// How long a halted vCPU polls before it blocks (Vcpu::halt_poll).
+/// The longest a halted vCPU polls before it blocks (Vcpu::halt_poll).
 const HALT_POLL_US: u64 = 100;
+/// A vCPU polls only while other guests leave its CPU about this much
+/// capacity (EventPage::host_cap, of 1024).  The hint is smoothed and
+/// rounds down, so it settles a little below 1024 after any neighbour's
+/// use; below this, polling would take a contended CPU from others.
+const HALT_POLL_MIN_CAP: u64 = 992;
+
+/// The next halt-poll window (TSC ticks), after a halt that blocked for
+/// `blocked` with the window `window`, as Linux's halt polling and the
+/// PV guest's idle loop adapt it (arch/l4h/kernel/time.c): a block that
+/// polling up to `max` would have caught grows it (from an eighth of
+/// `max`, doubling to `max`); a longer one ends polling.
+pub fn halt_poll_window(window: u64, blocked: u64, max: u64) -> u64 {
+    if blocked <= max { if window == 0 { max / 8 } else { window.saturating_mul(2).min(max) } } else { 0 }
+}
+
+/// Whether the capacity hint `host_cap` (0: none published) says other
+/// guests use this vCPU's CPU or its SMT siblings.
+pub fn contended(host_cap: u64) -> bool {
+    host_cap != 0 && host_cap < HALT_POLL_MIN_CAP
+}
 /// Iterations of a REP string instruction one exit does.
 const STRING_BATCH: u64 = 4096;
 
@@ -110,6 +130,16 @@ pub struct Vcpu<H: Hw> {
     /// is set in the guest's word (pv_eoi_to_guest).
     pv_eoi: u64,
     pv_eoi_set: bool,
+    /// MSR_KVM_STEAL_TIME as written; the steal its kvm_steal_time
+    /// holds (what the structure had when the guest named it, then what
+    /// vmmgr's steal_ns grew by since); the steal_ns last added; the
+    /// structure's version (steal_to_guest).
+    steal_msr: u64,
+    steal_acc: u64,
+    steal_seen: u64,
+    steal_version: u32,
+    /// The halt-poll window, in TSC ticks (halt_poll_window).
+    poll_window: u64,
     halted: bool,
     wait_sipi: bool,
     nmis: u32,
@@ -142,6 +172,7 @@ impl<H: Hw> Vcpu<H> {
         let mut c = Vcpu {
             id: v, hw, lapic: Lapic::new(vm.topology.apic_id[v], v == 0, vm.tsc_hz), msrs: msr::Msrs::new(vm.amd), tsc_offset: 0,
             kvm_time: 0, kvm_wall: 0, kvm_version: 0, pv_eoi: 0, pv_eoi_set: false,
+            steal_msr: 0, steal_acc: 0, steal_seen: 0, steal_version: 0, poll_window: 0,
             halted: false, wait_sipi: v != 0, nmis: 0, inject: None, dr: [0; 4], dr6: 0xffff_0ff0, dr7: 0x400, xcr0: 1, armed: 0,
         };
         c.lapic.init(shared(v));
@@ -182,8 +213,12 @@ impl<H: Hw> Vcpu<H> {
             self.halted = false;
             self.nmis = 0;
             self.inject = None;
-            // As KVM's reset: the guest names its PV EOI word again.
+            // As KVM's reset: the guest names its PV EOI word and its
+            // steal time structure again (an AP coming up does, in
+            // kvm_guest_cpu_init); nothing is written to the old ones.
             self.pv_eoi = 0;
+            (self.steal_msr, self.steal_acc, self.steal_seen, self.steal_version) = (0, 0, 0, 0);
+            self.poll_window = 0;
         }
         if flags & PENDING_SIPI != 0 && self.wait_sipi {
             sh.clear_requests();
@@ -223,6 +258,7 @@ impl<H: Hw> Vcpu<H> {
         }
         let irq_window = self.lapic.pending(sh).is_some();
         let nmi_window = self.nmis != 0;
+        self.steal_to_guest();
         self.pv_eoi_to_guest(sh);
         let exit = self.hw.enter(ev, irq_window, nmi_window);
         self.pv_eoi_from_guest();
@@ -232,35 +268,48 @@ impl<H: Hw> Vcpu<H> {
     /// Wait for something to do: an interrupt, the timer, INIT or SIPI.
     fn block(&mut self) {
         self.arm_timer();
-        if self.halted && self.halt_poll(vm::now()) {
+        let page = crate::sys::event_page(self.id);
+        // Not on a CPU other guests use: the poll would take their time,
+        // at our priority.  The window starts again from nothing after.
+        let contended = contended(unsafe { core::ptr::addr_of!((*page).host_cap).read_volatile() });
+        if contended {
+            self.poll_window = 0;
+        }
+        let start = vm::now();
+        if self.halted && self.poll_window != 0 && self.halt_poll(start, self.poll_window) {
             // What woke it may have signalled this thread too: taken now,
             // so the next VMEnter does not return at once to say so (turn
             // looks at the state itself).
             crate::sys::poll(self.id);
             return;
         }
-        // Idle: the time blocked.  The poll ran on the vCPU's budget, as
-        // its run time (vmmgr's steal is wall - run - idle).
+        // Idle: the time blocked.  A poll ran on the vCPU's budget, as its
+        // run time (vmmgr's steal is wall - run - idle); a block still in
+        // progress when vmmgr samples is idle_since's.
         let before = vm::now();
+        unsafe { crate::sync::idle_begin(page, before) };
         crate::sys::wait(self.id);
-        let page = host::vmm_event_page_va(self.id) as *mut abi::EventPage;
-        unsafe {
-            let p = core::ptr::addr_of_mut!((*page).idle_ticks);
-            p.write_volatile(p.read_volatile().wrapping_add(vm::now() - before));
+        let end = vm::now();
+        unsafe { crate::sync::idle_end(page, end.wrapping_sub(before)) };
+        // The window follows the whole wait, the poll that missed
+        // included, as KVM's block_ns: a poll and a block that together
+        // outlast the maximum end polling.
+        if self.halted && !contended {
+            self.poll_window = halt_poll_window(self.poll_window, end.wrapping_sub(start), vm().tsc_hz / 1_000_000 * HALT_POLL_US);
         }
     }
 
-    /// Halt polling, as KVM's halt_poll_ns: a halted vCPU watches, for a
-    /// while, for what would wake it (`turn`) before it blocks: an
-    /// interrupt it can take, an NMI, INIT or SIPI, its timer.  Each block
-    /// and wakeup costs host scheduling and, under a hypervisor, IPIs and
-    /// halts of its own; a guest waiting on I/O is often woken within tens
-    /// of microseconds.  vCPU 0 also runs the VM's I/O APIC and UART work
-    /// (Vm::pending_work).  Whether it was woken.
-    fn halt_poll(&self, start: u64) -> bool {
+    /// Halt polling, as KVM's halt_poll_ns: a halted vCPU watches, for up
+    /// to `ticks` (the adaptive window), for what would wake it (`turn`)
+    /// before it blocks: an interrupt it can take, an NMI, INIT or SIPI,
+    /// its timer.  Each block and wakeup costs host scheduling and, under
+    /// a hypervisor, IPIs and halts of its own; a guest waiting on I/O is
+    /// often woken within tens of microseconds.  vCPU 0 also runs the
+    /// VM's I/O APIC and UART work (Vm::pending_work).  Whether it was
+    /// woken.
+    fn halt_poll(&self, start: u64, ticks: u64) -> bool {
         let vm = vm();
         let sh = shared(self.id);
-        let ticks = vm.tsc_hz / 1_000_000 * HALT_POLL_US;
         loop {
             let now = vm::now();
             if sh.flags.load(Ordering::Relaxed) != 0
@@ -276,6 +325,69 @@ impl<H: Hw> Vcpu<H> {
             }
             core::hint::spin_loop();
         }
+    }
+
+    /// KVM's steal time (KVM_FEATURE_STEAL_TIME): the steal vmmgr
+    /// publishes in this vCPU's event page (wall - run - idle, updated each
+    /// balancer period), counted from when the guest named its structure,
+    /// written there before an entry when it changed.
+    fn steal_to_guest(&mut self) {
+        if self.steal_msr & pvclock::STEAL_TIME_ENABLE == 0 {
+            return;
+        }
+        let ns = self.host_steal();
+        if ns <= self.steal_seen {
+            return;
+        }
+        self.steal_acc = self.steal_acc.saturating_add(ns - self.steal_seen);
+        self.steal_seen = ns;
+        self.publish_steal();
+    }
+
+    /// vmmgr's steal_ns for this vCPU (monotonic).
+    fn host_steal(&self) -> u64 {
+        let page = crate::sys::event_page(self.id);
+        unsafe { core::ptr::addr_of!((*page).steal_ns).read_volatile() }
+    }
+
+    /// The guest names (or names again) its kvm_steal_time with `v`, the
+    /// enable bit set.  As KVM's record_steal_time, the structure's own
+    /// `steal` and version go on: a fresh structure is zero, and one
+    /// named again keeps what it was told (the guest's scheduler takes
+    /// steal - prev_steal_time, unsigned, which a smaller value would
+    /// turn into a huge steal).  Naming the one in use changes nothing.
+    fn name_steal_time(&mut self, v: u64) {
+        let old = core::mem::replace(&mut self.steal_msr, v);
+        if old == v {
+            return self.steal_to_guest();
+        }
+        let gpa = v & !(pvclock::STEAL_TIME_ENABLE | pvclock::STEAL_TIME_RESERVED);
+        let mem = &vm().mem;
+        (self.steal_acc, self.steal_version) = if mem.valid(gpa, pvclock::STEAL_TIME_SIZE as u64) {
+            (mem.read::<u64>(gpa), mem.read::<u32>(gpa + 8) & !1)
+        } else {
+            (0, 0)
+        };
+        self.steal_seen = self.host_steal();
+        self.publish_steal();
+    }
+
+    fn publish_steal(&mut self) {
+        let gpa = self.steal_msr & !(pvclock::STEAL_TIME_ENABLE | pvclock::STEAL_TIME_RESERVED);
+        let mem = &vm().mem;
+        // As KVM, an address that is not RAM is left alone.
+        if !mem.valid(gpa, pvclock::STEAL_TIME_SIZE as u64) {
+            return;
+        }
+        self.steal_version = self.steal_version.wrapping_add(2) & !1;
+        let b = pvclock::steal_time(self.steal_version, self.steal_acc);
+        pvclock::publish_steal(&b, |off, bytes| {
+            if bytes.len() == 4 {
+                mem.write::<u32>(gpa + off as u64, u32::from_le_bytes(bytes.try_into().unwrap()));
+            } else {
+                mem.write_bytes(gpa + off as u64, bytes);
+            }
+        });
     }
 
     /// KVM's PV EOI (KVM_FEATURE_PV_EOI): when the guest's EOI could do
@@ -653,6 +765,7 @@ impl<H: Hw> Vcpu<H> {
             pvclock::MSR_SYSTEM_TIME => return Some(self.kvm_time),
             pvclock::MSR_WALL_CLOCK => return Some(self.kvm_wall),
             pvclock::MSR_PV_EOI => return Some(self.pv_eoi),
+            pvclock::MSR_STEAL_TIME => return Some(self.steal_msr),
             _ => {}
         }
         if let Some(r) = self.hw.rdmsr(m) {
@@ -683,6 +796,20 @@ impl<H: Hw> Vcpu<H> {
             pvclock::MSR_WALL_CLOCK => {
                 self.kvm_wall = v;
                 self.publish_wall_clock();
+                return true;
+            }
+            pvclock::MSR_STEAL_TIME => {
+                // As KVM: bits 5:1 reserved (the address is then 64-byte
+                // aligned).  Steal counts from now; the structure starts
+                // at zero, as Linux's per-CPU one does.
+                if v & pvclock::STEAL_TIME_RESERVED != 0 {
+                    return false;
+                }
+                if v & pvclock::STEAL_TIME_ENABLE != 0 {
+                    self.name_steal_time(v);
+                } else {
+                    self.steal_msr = v;
+                }
                 return true;
             }
             pvclock::MSR_PV_EOI => {
@@ -1195,5 +1322,39 @@ pub extern "C" fn entry(v: usize) -> ! {
         let hw = crate::hw::vmx::Vmx::new(obj);
         vm().invpcid.store(hw.invpcid, Ordering::Relaxed);
         run(v, hw)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn halt_poll_window_adapts_as_the_pv_idle_loop() {
+        let max = 100_000;
+        // Starts off: the first halt blocks, and a short one opens it at
+        // an eighth, doubling up to the maximum.
+        let mut w = 0;
+        for want in [max / 8, max / 4, max / 2, max, max] {
+            w = halt_poll_window(w, max / 10, max);
+            assert_eq!(w, want);
+        }
+        // A block polling would not have caught ends polling at once.
+        assert_eq!(halt_poll_window(w, max + 1, max), 0);
+        assert_eq!(halt_poll_window(0, u64::MAX, max), 0, "a mostly idle vCPU never polls");
+        assert_eq!(halt_poll_window(max, max, max), max, "a block within the maximum keeps it");
+        // A poll that missed and the block after it count together: 100
+        // and 50 outlast the maximum.
+        assert_eq!(halt_poll_window(max, max + max / 2, max), 0);
+    }
+
+    #[test]
+    fn halt_poll_only_on_an_uncontended_cpu() {
+        assert!(!contended(0), "no hint (an older vmmgr): poll");
+        assert!(!contended(1024), "alone");
+        // The smoothed hint stays a little below 1024 after any neighbour
+        // used the CPU: still alone enough.
+        assert!(!contended(1023) && !contended(HALT_POLL_MIN_CAP));
+        assert!(contended(HALT_POLL_MIN_CAP - 1) && contended(512) && contended(128));
     }
 }

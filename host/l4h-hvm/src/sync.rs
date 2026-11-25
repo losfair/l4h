@@ -108,3 +108,97 @@ impl<T> Owned<T> {
         unsafe { &mut *self.0.get() }
     }
 }
+
+// ---- A vCPU thread's idle time, which vmmgr reads (its steal estimate).
+
+use core::sync::atomic::{AtomicU64, fence};
+
+/// idle_seq, idle_since and idle_ticks of an event page.
+unsafe fn idle_fields<'a>(page: *mut l4h_abi::EventPage) -> (&'a AtomicU64, &'a AtomicU64, &'a AtomicU64) {
+    unsafe {
+        (&*(core::ptr::addr_of_mut!((*page).idle_seq) as *const AtomicU64),
+            &*(core::ptr::addr_of_mut!((*page).idle_since) as *const AtomicU64),
+            &*(core::ptr::addr_of_mut!((*page).idle_ticks) as *const AtomicU64))
+    }
+}
+
+/// Change idle_since and idle_ticks under idle_seq (odd meanwhile), so
+/// that vmmgr reads both from one moment (l4h-vmmgr's sched::idle_ticks).
+fn idle_write(seq: &AtomicU64, f: impl FnOnce()) {
+    seq.store(seq.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
+    fence(Ordering::Release);
+    f();
+    seq.store(seq.load(Ordering::Relaxed).wrapping_add(1), Ordering::Release);
+}
+
+/// A block of the vCPU starts at `now` (EventPage::idle_since; never 0).
+///
+/// # Safety
+/// `page` is the vCPU's event page, whose idle fields only its thread
+/// writes.
+pub unsafe fn idle_begin(page: *mut l4h_abi::EventPage, now: u64) {
+    let (seq, since, _) = unsafe { idle_fields(page) };
+    idle_write(seq, || since.store(now.max(1), Ordering::Relaxed));
+}
+
+/// The block ended after `blocked` ticks: counted in idle_ticks, and
+/// idle_since cleared, together.
+///
+/// # Safety
+/// As idle_begin.
+pub unsafe fn idle_end(page: *mut l4h_abi::EventPage, blocked: u64) {
+    let (seq, since, idle) = unsafe { idle_fields(page) };
+    idle_write(seq, || {
+        idle.store(idle.load(Ordering::Relaxed).wrapping_add(blocked), Ordering::Relaxed);
+        since.store(0, Ordering::Relaxed);
+    });
+}
+
+/// `f`, during which the vCPU is blocked (a call to the I/O thread): idle
+/// as a wait is, timed by `now`.
+///
+/// # Safety
+/// As idle_begin.
+pub unsafe fn idle_during<T>(page: *mut l4h_abi::EventPage, now: impl Fn() -> u64, f: impl FnOnce() -> T) -> T {
+    let before = now();
+    unsafe { idle_begin(page, before) };
+    let r = f();
+    unsafe { idle_end(page, now().wrapping_sub(before)) };
+    r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What vmmgr reads of a block (l4h-vmmgr's sched::idle_ticks):
+    /// idle_since set while it lasts, never 0, idle_ticks updated as it
+    /// is cleared, and idle_seq even between the changes.
+    #[test]
+    fn idle_since_brackets_a_block() {
+        let mut page: std::boxed::Box<core::mem::MaybeUninit<l4h_abi::EventPage>> = std::boxed::Box::new_zeroed();
+        let p = page.as_mut_ptr();
+        let read = |p: *mut l4h_abi::EventPage| unsafe {
+            (core::ptr::addr_of!((*p).idle_since).read(), core::ptr::addr_of!((*p).idle_ticks).read(),
+                core::ptr::addr_of!((*p).idle_seq).read())
+        };
+        unsafe { idle_begin(p, 0) };
+        assert_eq!(read(p), (1, 0, 2), "a block at counter 0 still reads as one");
+        unsafe { idle_end(p, 500) };
+        assert_eq!(read(p), (0, 500, 4));
+        unsafe { idle_begin(p, 7_000) };
+        assert_eq!(read(p), (7_000, 500, 6), "in progress: not yet in idle_ticks");
+        unsafe { idle_end(p, 250) };
+        assert_eq!(read(p), (0, 750, 8), "the count even between changes");
+        // A call to the I/O thread is a block too, in progress while it lasts.
+        let t = core::cell::Cell::new(10_000u64);
+        let got = unsafe {
+            idle_during(p, || t.get(), || {
+                assert_eq!(read(p), (10_000, 750, 10), "in progress during the call");
+                t.set(10_300);
+                7
+            })
+        };
+        assert_eq!((got, read(p)), (7, (0, 1_050, 12)));
+    }
+}

@@ -478,6 +478,8 @@ impl Vmmgr {
                 return Err(ctl::EIO);
             }
         };
+        // Its CPU's PV kernels beside an HVM vCPU make room for it first.
+        sched::vmm_arriving(self, g.id, g.vmm_limits.expect("VMM limits").0);
         component::start(&v);
         g.vmm = Some(v);
         Ok(())
@@ -578,6 +580,7 @@ impl Vmmgr {
         // Everything of ours first, then root drains the disks and takes
         // back the I/O pool (Guest::destroy).
         g.destroy(&mut self.alloc);
+        sched::reconcile(self);
         info!("l4h-vmmgr: guest {} '{}' destroyed, {} MiB free", id, name, self.alloc.free_bytes() >> 20);
         Ok(())
     }
@@ -940,6 +943,9 @@ fn end_guest(h: &mut Vmmgr, id: usize, restart: bool) {
     }
     if let Some(Some(g)) = h.guests.get_mut(id) {
         g.stop();
+        // Its neighbours' limits follow at once (an HVM guest's PV
+        // neighbours have SC_K whole again).
+        sched::reconcile(h);
     }
     if h.guests.iter().flatten().all(|g| g.state != State::Running) {
         info!("l4h-vmmgr: all guests stopped");
@@ -1073,7 +1079,7 @@ impl l4h_ipc::Server for Serve<'_> {
         if badge & recv::TIMER != 0 {
             let h = &mut *self.h;
             let now = rdtsc();
-            sched::balance(h, (now - self.last_balance) * 1_000_000 / h.info.tsc_hz);
+            sched::balance(h, (now - self.last_balance) * 1_000_000 / h.info.tsc_hz, now);
             self.last_balance = now;
             if h.cfg.watchdog_secs != 0 && rdtsc() >= self.next_watchdog {
                 watchdog_dump(h);

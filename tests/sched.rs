@@ -9,6 +9,8 @@ mod topology;
 mod budget;
 
 use policy::{Action, Sample, choose, swap_moves};
+/// No VMM load on any CPU (policy::choose's `vmm_load`).
+const NO_VMM: [u64; topology::MAX_CPUS] = [0; topology::MAX_CPUS];
 use topology::Topology;
 
 const PERIOD: u64 = 100_000;
@@ -24,7 +26,7 @@ fn vmm_and_guest_share_caps_without_reserving_uncapped_cpu_time() {
             ] {
                 for k in [0, 1, 250, 500, 750, 999, 1000] {
                     for v in [0, 1, 250, 500, 750, 999, 1000] {
-                        let p = budget::plan(host_slice, minimum, cap, k, has_vmm.then_some(v));
+                        let p = budget::plan(host_slice, minimum, cap, k, has_vmm.then_some(v), false);
                         assert!(p.kernel >= budget::MIN_US && p.user >= budget::MIN_US);
                         assert!(if has_vmm { p.vmm >= budget::MIN_US } else { p.vmm == 0 });
                         if cap > 0 && (cap < 100 || has_vmm) {
@@ -46,13 +48,13 @@ fn vmm_and_guest_share_caps_without_reserving_uncapped_cpu_time() {
 #[test]
 fn capped_vmm_and_kernel_shares_follow_their_measured_demand() {
     let share = budget::VMM_SHARE_INIT;
-    let old = budget::plan(5000, 0, 50, 500, Some(share));
+    let old = budget::plan(5000, 0, 50, 500, Some(share), false);
     let (k, v) = budget::adapt(old, 500, share, [18_000, 18_000, 0], PERIOD).unwrap();
-    let cpu = budget::plan(5000, 0, 50, k, Some(v));
+    let cpu = budget::plan(5000, 0, 50, k, Some(v), false);
     assert!(budget::changed(old, cpu));
     assert_eq!(cpu.vmm, budget::MIN_US);
     let (k, v) = budget::adapt(old, 500, share, [100, 100, 12_500], PERIOD).unwrap();
-    let io = budget::plan(5000, 0, 50, k, Some(v));
+    let io = budget::plan(5000, 0, 50, k, Some(v), false);
     assert!(budget::changed(old, io));
     assert_eq!(io.vmm, io.period / 2 - 2 * budget::MIN_US);
     assert_eq!(io.kernel + io.user + io.vmm, io.period / 2);
@@ -63,7 +65,7 @@ fn capped_vmm_and_kernel_shares_follow_their_measured_demand() {
 
 #[test]
 fn only_the_largest_contending_vmm_loses_its_boost() {
-    let p = budget::plan(5000, 0, 0, 500, Some(250));
+    let p = budget::plan(5000, 0, 0, 500, Some(250), false);
     let decide = |used, total, largest, contended, elapsed| {
         budget::BoostGuard::default().boost(true, used, total, largest, contended, elapsed, p)
     };
@@ -79,7 +81,7 @@ fn only_the_largest_contending_vmm_loses_its_boost() {
 
 #[test]
 fn recovery_requires_continuous_quiet_and_ignores_neighbour_pressure() {
-    let p = budget::plan(5000, 0, 0, 500, Some(250));
+    let p = budget::plan(5000, 0, 0, 500, Some(250), false);
     let mut guard = budget::BoostGuard::default();
     assert!(!guard.boost(true, 90_000, 90_000, 90_000, true, PERIOD, p));
     let p = budget::background(p, 1);
@@ -92,7 +94,7 @@ fn recovery_requires_continuous_quiet_and_ignores_neighbour_pressure() {
 
 #[test]
 fn quiet_spin_cycles_back_off_instead_of_stalling_guests_every_other_sample() {
-    let p = budget::plan(5000, 0, 0, 500, Some(250));
+    let p = budget::plan(5000, 0, 0, 500, Some(250), false);
     let mut guard = budget::BoostGuard::default();
     let mut boosted = true;
     let mut bursts = 0;
@@ -106,7 +108,7 @@ fn quiet_spin_cycles_back_off_instead_of_stalling_guests_every_other_sample() {
 
 #[test]
 fn old_demotion_history_expires_after_a_minute_without_another_demotion() {
-    let p = budget::plan(5000, 0, 0, 500, Some(250));
+    let p = budget::plan(5000, 0, 0, 500, Some(250), false);
     let mut guard = budget::BoostGuard::default();
     for wait in [1, 2, 4, 8, 16, 16] {
         assert!(!guard.boost(true, PERIOD, PERIOD, PERIOD, true, PERIOD, p));
@@ -121,7 +123,7 @@ fn old_demotion_history_expires_after_a_minute_without_another_demotion() {
 
 #[test]
 fn another_demotion_restarts_the_history_expiry_window() {
-    let p = budget::plan(5000, 0, 0, 500, Some(250));
+    let p = budget::plan(5000, 0, 0, 500, Some(250), false);
     let mut guard = budget::BoostGuard::default();
     assert!(!guard.boost(true, PERIOD, PERIOD, PERIOD, true, PERIOD, p));
     assert!(guard.boost(false, 0, 0, 0, false, 1_000_000, p));
@@ -142,7 +144,7 @@ fn background_vmms_share_half_a_core_without_exceeding_guest_caps() {
     for peers in 1..=64 {
         for cap in 0..=100 {
             for minimum in [0, 40_000] {
-                let p = budget::plan(5000, minimum, cap, 500, Some(250));
+                let p = budget::plan(5000, minimum, cap, 500, Some(250), false);
                 let q = budget::background(p, peers);
                 assert!(q.vmm >= budget::MIN_US);
                 assert!(q.vmm * 2 * peers as u64 <= q.vmm_period);
@@ -156,11 +158,11 @@ fn background_vmms_share_half_a_core_without_exceeding_guest_caps() {
 #[test]
 fn vcpus_without_a_vmm_keep_the_existing_two_context_budget() {
     for cap in 1..100 {
-        let p = budget::plan(5000, 0, cap, 500, None);
+        let p = budget::plan(5000, 0, cap, 500, None, false);
         assert_eq!(p.kernel + p.user, p.period * cap as u64 / 100);
         assert_eq!(p.vmm, 0);
     }
-    let p = budget::plan(5000, 0, 1, 500, None);
+    let p = budget::plan(5000, 0, 1, 500, None, false);
     assert_eq!((p.period, p.kernel, p.user), (40_000, 200, 200));
 }
 
@@ -181,7 +183,7 @@ fn apply(t: &Topology, s: &mut [Sample], a: Action) -> Vec<(usize, usize)> {
     let mut moves = Vec::new();
     match a {
         Action::IntraCore { guest, vcpu, dst, .. } => moves.push((guest, vcpu, dst)),
-        Action::VcoreSwap { guest, ps, pd } => swap_moves(t, s, PERIOD, guest, ps, pd, |v, dst| moves.push((guest, v, dst))),
+        Action::VcoreSwap { guest, ps, pd } => swap_moves(t, s, PERIOD, &NO_VMM, guest, ps, pd, |v, dst| moves.push((guest, v, dst))),
     }
     let mut cpus = Vec::new();
     for (g, v, dst) in moves {
@@ -193,7 +195,7 @@ fn apply(t: &Topology, s: &mut [Sample], a: Action) -> Vec<(usize, usize)> {
 }
 
 fn step(t: &Topology, s: &[Sample]) -> Option<(usize, usize)> {
-    let a = choose(t, s, PERIOD)?;
+    let a = choose(t, s, PERIOD, &NO_VMM)?;
     let mut copy: Vec<_> = s.iter().map(|x| Sample { ..*x }).collect();
     let moved = apply(t, &mut copy, a);
     assert_eq!(moved.len(), 1, "{a:?}");
@@ -223,21 +225,21 @@ fn busy_smt_siblings_use_an_idle_physical_core() {
 fn one_busy_vcpu_per_physical_core_stays_put() {
     let t = Topology::from_ids(&[0, 0, 1, 1]);
     let s = [vcpu(0, 0, 0, PERIOD), vcpu(1, 0, 2, PERIOD)];
-    assert_eq!(choose(&t, &s, PERIOD), None);
+    assert_eq!(choose(&t, &s, PERIOD, &NO_VMM), None);
 }
 
 #[test]
 fn all_threads_busy_and_balanced_stay_put() {
     let t = Topology::from_ids(&[0, 0, 1, 1]);
     let s: Vec<_> = (0..4).map(|cpu| vcpu(cpu, 0, cpu, PERIOD)).collect();
-    assert_eq!(choose(&t, &s, PERIOD), None);
+    assert_eq!(choose(&t, &s, PERIOD, &NO_VMM), None);
 }
 
 #[test]
 fn balance_within_a_physical_core_when_no_spare_core() {
     let t = Topology::from_ids(&[0, 0, 1, 1]);
     let s = [vcpu(0, 0, 0, PERIOD / 2), vcpu(1, 0, 0, PERIOD / 2), vcpu(2, 0, 2, PERIOD), vcpu(3, 0, 3, PERIOD)];
-    assert!(matches!(choose(&t, &s, PERIOD), Some(Action::IntraCore { src: 0, dst: 1, .. })));
+    assert!(matches!(choose(&t, &s, PERIOD, &NO_VMM), Some(Action::IntraCore { src: 0, dst: 1, .. })));
 }
 
 #[test]
@@ -252,9 +254,9 @@ fn cooldown_vcpus_are_counted_but_not_moved() {
     let t = Topology::from_ids(&[0, 0, 1, 1]);
     let mut s = [vcpu(0, 0, 0, PERIOD), vcpu(1, 0, 1, PERIOD)];
     s[0].movable = false;
-    assert_eq!(choose(&t, &s, PERIOD), Some(Action::VcoreSwap { guest: 1, ps: 0, pd: 2 }));
+    assert_eq!(choose(&t, &s, PERIOD, &NO_VMM), Some(Action::VcoreSwap { guest: 1, ps: 0, pd: 2 }));
     s[1].movable = false;
-    assert_eq!(choose(&t, &s, PERIOD), None);
+    assert_eq!(choose(&t, &s, PERIOD, &NO_VMM), None);
 }
 
 #[test]
@@ -264,7 +266,7 @@ fn equivalent_destinations_prefer_moving_a_vcore_to_swapping_it() {
     // would gain as much as taking the empty core 2.
     let mut s = vcores(&t, vec![vcpu(0, 0, 0, PERIOD), vcpu(1, 0, 1, PERIOD), vcpu(0, 1, 2, 0)]);
     s[1].movable = false;
-    assert_eq!(choose(&t, &s, PERIOD), Some(Action::VcoreSwap { guest: 0, ps: 0, pd: 4 }));
+    assert_eq!(choose(&t, &s, PERIOD, &NO_VMM), Some(Action::VcoreSwap { guest: 0, ps: 0, pd: 4 }));
     assert_eq!(step(&t, &s), Some((0, 4)));
 }
 
@@ -275,7 +277,7 @@ fn lightly_loaded_targets_and_flat_topology_keep_working() {
     assert_eq!(step(&t, &s), Some((0, 1)));
     let mut full = s;
     full[2].used = PERIOD;
-    assert_eq!(choose(&t, &full, PERIOD), None);
+    assert_eq!(choose(&t, &full, PERIOD, &NO_VMM), None);
 }
 
 #[test]
@@ -284,10 +286,10 @@ fn starved_busy_vcpus_count_and_low_caps_do_not_trigger_migration() {
     let s: Vec<_> = (0..10).map(|g| vcpu(g, 0, 0, PERIOD / 10)).collect();
     assert_eq!(step(&t, &s), Some((0, 1)));
     let capped = [vcpu(0, 0, 0, PERIOD / 10), vcpu(1, 0, 0, PERIOD / 10)];
-    assert_eq!(choose(&t, &capped, PERIOD), None);
-    assert_eq!(choose(&t, &s, 0), None);
-    assert_eq!(choose(&Topology::flat(1), &[vcpu(0, 0, 0, PERIOD)], PERIOD), None);
-    assert_eq!(choose(&t, &[], PERIOD), None);
+    assert_eq!(choose(&t, &capped, PERIOD, &NO_VMM), None);
+    assert_eq!(choose(&t, &s, 0, &NO_VMM), None);
+    assert_eq!(choose(&Topology::flat(1), &[vcpu(0, 0, 0, PERIOD)], PERIOD, &NO_VMM), None);
+    assert_eq!(choose(&t, &[], PERIOD, &NO_VMM), None);
 }
 
 #[test]
@@ -311,7 +313,7 @@ fn a_busy_vcore_trades_places_with_the_guests_idle_one_as_a_whole() {
         vcpu(0, 2, 2, 0), vcpu(0, 3, 3, 0), vcpu(2, 0, 4, PERIOD), vcpu(2, 1, 5, PERIOD)];
     let mut s = vcores(&t, s);
     s[2].movable = false;
-    assert_eq!(choose(&t, &s, PERIOD), Some(Action::VcoreSwap { guest: 0, ps: 0, pd: 2 }));
+    assert_eq!(choose(&t, &s, PERIOD, &NO_VMM), Some(Action::VcoreSwap { guest: 0, ps: 0, pd: 2 }));
     let moved = apply(&t, &mut s, Action::VcoreSwap { guest: 0, ps: 0, pd: 2 });
     // All four vCPUs move; the busy ones each alone on a CPU of core 2,
     // the idle ones beside guest 1's vCPU, which keeps its CPU.
@@ -328,12 +330,12 @@ fn a_split_or_cooling_vcore_does_not_move() {
     let t = Topology::from_ids(&[0, 0, 1, 1]);
     let mut s = vcores(&t, vec![vcpu(0, 0, 0, PERIOD), vcpu(0, 1, 1, PERIOD), vcpu(1, 0, 0, PERIOD)]);
     s[2].movable = false;
-    assert_eq!(choose(&t, &s, PERIOD), Some(Action::VcoreSwap { guest: 0, ps: 0, pd: 2 }));
+    assert_eq!(choose(&t, &s, PERIOD, &NO_VMM), Some(Action::VcoreSwap { guest: 0, ps: 0, pd: 2 }));
     s[1].movable = false;
-    assert!(!matches!(choose(&t, &s, PERIOD), Some(Action::VcoreSwap { .. })));
+    assert!(!matches!(choose(&t, &s, PERIOD, &NO_VMM), Some(Action::VcoreSwap { .. })));
     s[1].movable = true;
     s[1].vcore = 7;
-    assert!(!matches!(choose(&t, &s, PERIOD), Some(Action::VcoreSwap { .. })));
+    assert!(!matches!(choose(&t, &s, PERIOD, &NO_VMM), Some(Action::VcoreSwap { .. })));
 }
 
 #[test]
@@ -343,24 +345,24 @@ fn hybrid_cores_do_not_take_a_wider_vcore() {
     let mut s = vcores(&t, vec![vcpu(0, 0, 0, PERIOD), vcpu(0, 1, 1, PERIOD), vcpu(1, 0, 0, PERIOD), vcpu(1, 1, 1, PERIOD)]);
     s[2].movable = false;
     s[3].movable = false;
-    assert_eq!(choose(&t, &s, PERIOD), None);
+    assert_eq!(choose(&t, &s, PERIOD, &NO_VMM), None);
     // One vCPU wide, it fits.
     s.remove(1);
-    assert!(matches!(choose(&t, &s, PERIOD), Some(Action::VcoreSwap { guest: 0, ps: 0, pd: 2 | 3 })));
+    assert!(matches!(choose(&t, &s, PERIOD, &NO_VMM), Some(Action::VcoreSwap { guest: 0, ps: 0, pd: 2 | 3 })));
     // A narrow core's vCore may not trade places with a wide one either.
     let mut s = vcores(&t, vec![vcpu(0, 0, 0, PERIOD), vcpu(0, 1, 1, 0), vcpu(0, 2, 2, 0), vcpu(1, 0, 0, PERIOD),
         vcpu(1, 1, 1, PERIOD), vcpu(2, 0, 3, PERIOD)]);
     for v in &mut s[3..] {
         v.movable = false;
     }
-    assert!(!matches!(choose(&t, &s, PERIOD), Some(Action::VcoreSwap { guest: 0, pd: 2, .. })));
+    assert!(!matches!(choose(&t, &s, PERIOD, &NO_VMM), Some(Action::VcoreSwap { guest: 0, pd: 2, .. })));
 }
 
 #[test]
 fn siblings_balance_within_a_core_without_leaving_it() {
     let t = Topology::from_ids(&[0, 0, 1, 1]);
     let s = vcores(&t, vec![vcpu(0, 0, 0, PERIOD / 2), vcpu(0, 1, 0, PERIOD / 2), vcpu(0, 2, 2, PERIOD), vcpu(0, 3, 3, PERIOD)]);
-    assert!(matches!(choose(&t, &s, PERIOD), Some(Action::IntraCore { guest: 0, src: 0, dst: 1, .. })));
+    assert!(matches!(choose(&t, &s, PERIOD, &NO_VMM), Some(Action::IntraCore { guest: 0, src: 0, dst: 1, .. })));
 }
 
 #[test]
@@ -386,7 +388,7 @@ fn equal_vcores_do_not_ping_pong() {
         for v in &mut s {
             v.used = if v.vcpu < 2 { PERIOD / active[v.cpu] } else { 0 };
         }
-        let Some(a) = choose(&t, &s, PERIOD) else { break };
+        let Some(a) = choose(&t, &s, PERIOD, &NO_VMM) else { break };
         apply(&t, &mut s, a);
         assert_vcores_whole(&t, &s);
         moves += 1;
@@ -463,7 +465,7 @@ fn repeated_steps_converge_on_smt_and_flat_hosts() {
                 for v in &mut s {
                     v.used = PERIOD / counts[v.cpu];
                 }
-                let Some(a) = choose(&t, &s, PERIOD) else { break };
+                let Some(a) = choose(&t, &s, PERIOD, &NO_VMM) else { break };
                 assert!(step < 199, "balancer did not settle: {ids:?}, {count}");
                 apply(&t, &mut s, a);
             }
@@ -496,4 +498,156 @@ fn physical_cores_counts_distinct_cores() {
     for cpus in [0, 1, 4, topology::MAX_CPUS] {
         assert_eq!(Topology::flat(cpus).physical_cores(), cpus);
     }
+}
+
+/// An HVM vCPU runs on SC_K alone: its plan reserves nothing for an SC_U
+/// it does not have (a shorter period at low caps), and gives the guest's
+/// whole part to SC_K.
+#[test]
+fn single_sc_plans_give_the_guest_one_context() {
+    for has_vmm in [false, true] {
+        for cap in 1..100 {
+            let vmm = has_vmm.then_some(budget::VMM_SHARE_INIT);
+            let p = budget::plan(5000, 0, cap, 500, vmm, true);
+            assert_eq!(p.user, 0);
+            assert!(p.kernel >= budget::MIN_US);
+            assert!(if has_vmm { p.vmm >= budget::MIN_US } else { p.vmm == 0 });
+            assert_eq!(p.kernel + p.vmm, p.period * cap as u64 / 100);
+        }
+    }
+    // At 1%: one or two parts of MIN_US, not two or three.
+    let min = budget::MIN_US;
+    assert_eq!(budget::plan(5000, 0, 1, 500, None, true).period, min * 100);
+    assert_eq!(budget::plan(5000, 0, 1, 500, None, false).period, 2 * min * 100);
+    assert_eq!(budget::plan(5000, 0, 1, 500, Some(250), true).period, 2 * min * 100);
+    assert_eq!(budget::plan(5000, 0, 1, 500, Some(250), false).period, 3 * min * 100);
+}
+
+/// budget::adapt for a single-SC vCPU: SC_K's use against the guest's
+/// whole budget, so half of it is not saturation, and a saturated one
+/// keeps its kernel share (there is no user part to split with).
+#[test]
+fn a_single_sc_vcpu_adapts_only_when_it_saturates() {
+    let share = budget::VMM_SHARE_INIT;
+    let old = budget::plan(5000, 0, 50, 500, Some(share), true);
+    let full = |budget: u64| budget * PERIOD / old.period;
+    // Half its budget, a little VMM: nothing to change (no SC_U to call
+    // idle, so no spurious saturation either).
+    assert_eq!(budget::adapt(old, 500, share, [full(old.kernel) / 2, 0, full(old.vmm) / 4], PERIOD), None);
+    // Saturated: the VMM's share follows its use, SC_K keeps the split.
+    let (k, v) = budget::adapt(old, 500, share, [full(old.kernel), 0, full(old.vmm) / 4], PERIOD).unwrap();
+    assert_eq!(k, 500);
+    let next = budget::plan(5000, 0, 50, k, Some(v), true);
+    assert!(budget::changed(old, next));
+    assert!(next.kernel > old.kernel && next.vmm < old.vmm);
+    assert_eq!((next.user, next.kernel + next.vmm), (0, next.period / 2));
+}
+
+/// Beside an HVM vCPU, a PV vCPU's SC_K gets at most 1/divisor of its
+/// period (the PV kernels there share a half or a quarter of the CPU); an
+/// uncapped SC_U keeps its round-robin budget and timeslice, a capped one
+/// takes what SC_K gives up, so the cap holds; a period too short for the
+/// divisor grows, for SC_K and a capped SC_U.
+#[test]
+fn a_limited_kernel_gets_its_part_of_the_period_and_the_cap_holds() {
+    let rr = budget::plan(5000, 0, 0, 500, None, false);
+    assert_eq!(rr.user_period, rr.period);
+    assert_eq!(budget::limit_kernel(rr, 0), rr, "0: no limit");
+    for div in [2, 4, 6, 8, 16, 100, 101, 256, 400] {
+        for vmm in [None, Some(250)] {
+            let old = budget::plan(5000, 0, 0, 500, vmm, false);
+            let p = budget::limit_kernel(old, div);
+            assert_eq!(p.kernel, p.period / div);
+            assert!(p.kernel >= budget::MIN_US && p.period >= old.period);
+            assert_eq!((p.user, p.user_period), (old.user, old.user_period), "SC_U's round robin as it was");
+            assert_eq!((p.vmm, p.vmm_period), (old.vmm, old.vmm_period), "the VMM is not limited");
+        }
+        for cap in 1..=100 {
+            for k in [0, 250, 500, 750, 1000] {
+                for vmm in [None, Some(250)] {
+                    let old = budget::plan(5000, 0, cap, k, vmm, false);
+                    if old.kernel == old.period { continue; }
+                    let p = budget::limit_kernel(old, div);
+                    assert!(p.kernel >= budget::MIN_US && p.user >= budget::MIN_US);
+                    assert!(p.kernel <= p.period / div, "cap {cap} k {k} div {div}: {p:?}");
+                    assert_eq!(p.user_period, p.period, "a capped SC_U's period follows");
+                    assert_eq!((p.vmm, p.vmm_period), (old.vmm, old.vmm_period));
+                    // The vCPU's part of the CPU is what it was, but for
+                    // rounding where the period grew.
+                    let (was, now) = ((old.kernel + old.user) as u128 * p.period as u128,
+                        (p.kernel + p.user) as u128 * old.period as u128);
+                    assert!(now <= was && was - now <= 2 * p.period as u128, "cap {cap} k {k} div {div}: {old:?} -> {p:?}");
+                    if old.kernel <= old.period / div && old.period >= budget::MIN_US * div {
+                        assert_eq!(p, old, "already within: unchanged");
+                    }
+                }
+            }
+        }
+    }
+    // 64 PV vCPUs and a VMM beside an HVM vCPU (a divisor of 256): SC_K
+    // 200 us of 51.2 ms; an uncapped SC_U keeps its 20 ms round robin, no
+    // longer turns than the HVM vCPU's beside it.
+    let p = budget::limit_kernel(budget::plan(5000, 0, 0, 500, Some(250), false), 256);
+    assert_eq!((p.kernel, p.period, p.user, p.user_period), (200, 51_200, 20_000, 20_000));
+    // At 1% of 40 ms (200 us each) and a divisor of 400, the period grows
+    // to 80 ms, both budgets with it.
+    let p = budget::limit_kernel(budget::plan(5000, 0, 1, 500, None, false), 400);
+    assert_eq!((p.period, p.kernel, p.user, p.user_period), (80_000, 200, 600, 80_000));
+    // A single-SC (HVM) plan has no user part, capped or not.
+    assert_eq!(budget::plan(5000, 0, 0, 500, Some(250), true).user, 0);
+    assert_eq!(budget::plan(5000, 0, 100, 500, None, true).user, 0);
+    // A changed SC_U period is a change.
+    let mut q = p;
+    q.user_period += 1;
+    assert!(budget::changed(p, q));
+}
+
+/// What VMMs use of a CPU is load there, and from VMM_BUSY_PCT on one more
+/// busy thread that stays; a vCPU's share is of what they leave: a PV
+/// vCPU a busy HVM monitor holds down still counts as busy and moves to a
+/// free CPU ...
+#[test]
+fn a_vcpu_crowded_by_a_busy_monitor_moves_to_a_free_cpu() {
+    let t = Topology::flat(2);
+    for (monitor, used) in [(60, 30), (76, 24), (90, 10)] {
+        let s = vcores(&t, vec![vcpu(0, 0, 0, PERIOD * used / 100)]);
+        assert_eq!(choose(&t, &s, PERIOD, &NO_VMM), None, "alone, {used}% is not busy");
+        let mut vmm = NO_VMM;
+        vmm[0] = PERIOD * monitor / 100;
+        assert_eq!(choose(&t, &s, PERIOD, &vmm), Some(Action::VcoreSwap { guest: 0, ps: 0, pd: 1 }),
+            "{used}% beside a monitor at {monitor}%");
+    }
+    // Below VMM_BUSY_PCT the monitor is not a busy thread.
+    let s = vcores(&t, vec![vcpu(0, 0, 0, PERIOD * 3 / 10)]);
+    let mut vmm = NO_VMM;
+    vmm[0] = PERIOD / 5;
+    assert_eq!(choose(&t, &s, PERIOD, &vmm), None);
+}
+
+/// ... and no busy vCPU is brought to a CPU a busy monitor uses.
+#[test]
+fn busy_vcpus_are_not_brought_to_a_busy_monitors_cpu() {
+    let t = Topology::flat(2);
+    let s = vcores(&t, vec![vcpu(0, 0, 0, PERIOD / 2), vcpu(1, 0, 0, PERIOD / 2)]);
+    assert!(choose(&t, &s, PERIOD, &NO_VMM).is_some(), "an empty CPU takes one");
+    let mut vmm = NO_VMM;
+    vmm[1] = PERIOD * 9 / 10;
+    assert_eq!(choose(&t, &s, PERIOD, &vmm), None);
+    vmm[1] = PERIOD / 5;
+    assert!(choose(&t, &s, PERIOD, &vmm).is_some(), "a monitor below VMM_BUSY_PCT leaves room");
+}
+
+/// Beside an HVM vCPU a core is crowded above three quarters (VMMs and PV
+/// kernels together), so that PRIO_USER keeps a quarter; elsewhere VMMs
+/// crowd it at 80%.
+#[test]
+fn crowding_beside_an_hvm_vcpu_starts_above_three_quarters() {
+    use budget::Crowded;
+    assert!(!Crowded::BesideHvm.at(75_000, PERIOD) && Crowded::BesideHvm.at(75_001, PERIOD));
+    assert!(!Crowded::Vmms.at(79_999, PERIOD) && Crowded::Vmms.at(80_000, PERIOD));
+    let p = budget::plan(5000, 0, 0, 500, Some(250), false);
+    let demote = |crowd, how| budget::BoostGuard::default().boost_when(true, 52_000, crowd, 52_000, true, PERIOD, p, how);
+    assert!(!demote(77_000, Crowded::BesideHvm), "52% and a PV kernel's 25%: demoted");
+    assert!(demote(77_000, Crowded::Vmms), "elsewhere 77% is not crowded");
+    assert!(demote(75_000, Crowded::BesideHvm), "exactly three quarters leaves a quarter");
 }

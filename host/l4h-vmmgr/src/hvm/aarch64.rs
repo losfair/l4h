@@ -275,7 +275,7 @@ pub fn create(
         h.vcpu_objs.must_push(self_cap::<cap_type::Unspecified>(vcpu));
         h.guest_tcbs.must_push(guest_tcb);
         g.vcpus.must_push(Vcpu { ktcb, ntfn, event, sc_k, sc_u: None, core, vcore, host_cap: 1024, cooldown: 0, usage: 0,
-            k_share: crate::sched::K_SHARE_INIT, wall_ticks: 0, run_ticks: 0, steal_ns: 0 });
+            k_share: crate::sched::K_SHARE_INIT, kernel_divisor: 0, wall_ticks: 0, run_ticks: 0, steal_ns: 0 });
     }
     for v in 0..g.vcpus.len() {
         let ev = g.vcpus[v].event;
@@ -539,7 +539,9 @@ pub fn spawn(
         let bytes = unsafe {
             core::slice::from_raw_parts(cfg as *const hv::HvmConfig as *const u8, core::mem::size_of::<hv::HvmConfig>())
         };
-        let core = g.vcpus[0].core;
+        // sched::prepare_vmm's choice (hvm_monitor_core), as on x86-64:
+        // vmm_limits names the core whose SchedControl configures it.
+        let core = g.vmm_limits.map_or(g.vcpus[0].core, |(core, _)| core);
         let args = SpawnArgs {
             id: g.id as u32,
             kind: host::KIND_HVM,

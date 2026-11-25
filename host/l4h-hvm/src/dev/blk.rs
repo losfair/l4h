@@ -376,7 +376,10 @@ impl Blk {
                         self.release(&inf);
                     }
                 }
-                None => crate::yield_now(),
+                // blkd runs above us (PRIO_SERVICE), on its own core or
+                // preempting this one: spin.  seL4_Yield would give up the
+                // rest of a limited scheduling context's refill.
+                None => core::hint::spin_loop(),
             }
         }
     }
