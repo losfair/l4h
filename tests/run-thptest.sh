@@ -7,11 +7,15 @@ source "$root/tools/guest-env.sh"
 out=$root/build/thptest
 mkdir -p "$out/page-aging"
 "$l4h_cc" -O2 -g -Wall -Wextra -static -pthread -o "$out/thptest" "$root/tests/guest/thptest.c"
-cp "$root"/tests/guest/page-aging/* "$out/page-aging/"
-"$root/tools/build-linux.sh" vmlinux modules >"$out/build.log" 2>&1 \
-    || { tail -80 "$out/build.log"; exit 1; }
-"$root/tools/build-linux.sh" M="$out/page-aging" modules >"$out/module.log" 2>&1 \
-    || { cat "$out/module.log"; exit 1; }
+if [[ ${L4H_PREBUILT:-0} == 1 || ${L4H_PREBUILT:-0} == guest ]] && [ -f "$root/build/guest/page-aging/l4h_page_aging.ko" ]; then
+    cp "$root/build/guest/page-aging/l4h_page_aging.ko" "$out/page-aging/l4h_page_aging.ko"
+elif [[ ${L4H_PREBUILT:-0} != 1 && ${L4H_PREBUILT:-0} != guest ]] || [ ! -f "$out/page-aging/l4h_page_aging.ko" ]; then
+    cp "$root"/tests/guest/page-aging/* "$out/page-aging/"
+    "$root/tools/build-linux.sh" vmlinux modules >"$out/build.log" 2>&1 \
+        || { tail -80 "$out/build.log"; exit 1; }
+    "$root/tools/build-linux.sh" M="$out/page-aging" modules >"$out/module.log" 2>&1 \
+        || { cat "$out/module.log"; exit 1; }
+fi
 "$root/tools/mkinitramfs.sh" "$out/initrd.cpio.gz" "$root/tests/guest/init-thptest" \
     "$out/thptest" "$out/page-aging/l4h_page_aging.ko" >/dev/null
 disk=$(mktemp "$out/swap.XXXXXX")

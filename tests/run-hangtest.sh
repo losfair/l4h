@@ -22,14 +22,18 @@ for i in 0 1; do
     mkfs.ext4 -q -F "$out/hang$i.img" 32M
 done
 export L4H_GUEST_KERNEL="$l4h_linux_out/vmlinux.stripped" L4H_DOM0_INITRD="$out/hangtest.cpio.gz"
-L4H_TEST_INJECT=1 L4H_DOM0_DISKS=0 L4H_DOM0_MEM_MB=512 \
-    L4H_DOM0_CMDLINE="console=hvc0 L4H_TEST_SLOW=$l4h_test_slow" "$l4h_host_build"
+cat >"$out/hangtest.conf" <<CONF
+dom0_disks=0
+dom0_mem_mb=512
+dom0_cmdline="console=hvc0 L4H_TEST_SLOW=$l4h_test_slow"
+CONF
+L4H_TEST_INJECT=1 "$l4h_host_build"
 log=$root/build/qemu-hang.log
 fifo=$(mktemp -u)
 mkfifo "$fifo"
 qemu=
 trap 'rm -f "$fifo"; [ -z "$qemu" ] || kill "$qemu" 2>/dev/null || true' EXIT
-"$l4h_qemu" "$root/host/target/$l4h_target/$l4h_profile/l4h-root.elf" \
+L4H_CONFIG="$out/hangtest.conf" "$l4h_qemu" "$root/host/target/$l4h_target/$l4h_profile/l4h-root.elf" \
     -drive file="$out/hang0.img",if=none,id=d0,format=raw -device virtio-blk-pci,drive=d0,disable-legacy=on \
     -drive file="$out/hang1.img",if=none,id=d1,format=raw -device virtio-blk-pci,drive=d1,disable-legacy=on \
     <"$fifo" >"$log" 2>&1 &

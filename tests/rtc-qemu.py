@@ -4,6 +4,7 @@
 Run via tests/run-rtctest.sh --qemu. qtest accesses only the emulated RTC.
 """
 import calendar
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -72,6 +73,7 @@ def run_case(directory, mode, control):
     arch = "aarch64" if ARM else "x86_64"
     log = ROOT / "build" / f"rtc-qemu-{arch}-{name}.log"
     env = dict(os.environ, L4H_CONFIG=str(config), L4H_BALLOON="0",
+               L4H_MODULES_OUT=str(directory / "l4h-root-dom0.elf"),
                L4H_SMP=os.environ.get("L4H_SMP", "4" if ARM else "2"))
     with log.open("wb") as output:
         proc = subprocess.Popen([str(RUNNER), str(root_elf(arch)),
@@ -151,8 +153,20 @@ def run_case(directory, mode, control):
                 proc.wait()
 
 
-with tempfile.TemporaryDirectory(prefix="l4h-rtc-") as temporary:
-    directory = Path(temporary)
-    for control in ([2] if ARM else [2, 0, 6, 4]):
-        run_case(directory, "explicit", control)
-    run_case(directory, "default", 2)
+cases = [("explicit", control) for control in ([2] if ARM else [2, 0, 6, 4])] + [("default", 2)]
+workers = 1 if ARM else int(os.environ.get("RTCTEST_JOBS", min(len(cases), os.cpu_count() or 1)))
+
+
+def run_isolated(item):
+    mode, control = item
+    with tempfile.TemporaryDirectory(prefix=f"l4h-rtc-{mode}-{control:02x}-") as temporary:
+        run_case(Path(temporary), mode, control)
+
+
+if workers <= 1:
+    for item in cases:
+        run_isolated(item)
+else:
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for fut in [pool.submit(run_isolated, item) for item in cases]:
+            fut.result()

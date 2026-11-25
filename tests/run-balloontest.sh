@@ -14,21 +14,28 @@ mkdir -p "$out"
 hold=12
 "$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
     || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
-"$l4h_objcopy" --strip-debug "$l4h_linux_out/vmlinux" "$l4h_linux_out/vmlinux.stripped"
+if [ ! -f "$l4h_linux_out/vmlinux.stripped" ] || [ "$l4h_linux_out/vmlinux" -nt "$l4h_linux_out/vmlinux.stripped" ]; then
+    "$l4h_objcopy" --strip-debug "$l4h_linux_out/vmlinux" "$l4h_linux_out/vmlinux.stripped"
+fi
 "$root/tools/build-l4hctl.sh"
 "$root/tools/mkinitramfs.sh" "$out/balloonvm.cpio.gz" "$root/tests/guest/init-balloonvm" >/dev/null
 "$root/tools/mkinitramfs.sh" "$out/balloontest.cpio.gz" "$root/tests/guest/init-balloontest" \
     "$l4h_ctl" "$out/balloonvm.cpio.gz" >/dev/null
 export L4H_GUEST_KERNEL="$l4h_linux_out/vmlinux.stripped" L4H_DOM0_INITRD="$out/balloontest.cpio.gz"
-L4H_DOM0_MEM_MB=256 L4H_DOM0_VCPUS=1 L4H_WATCHDOG_SECS=0 \
-    L4H_DOM0_CMDLINE="console=hvc0 BT_HOLD=$((hold * l4h_test_slow))" "$l4h_host_build"
+cat >"$out/balloontest.conf" <<CONF
+dom0_mem_mb=256
+dom0_vcpus=1
+watchdog_secs=0
+dom0_cmdline="console=hvc0 BT_HOLD=$((hold * l4h_test_slow))"
+CONF
+"$l4h_host_build"
 
 baseline=${BALLOONTEST_BASELINE:-0}
 log=$root/build/qemu.log
 : >"$log"
 balloon=$((1 - baseline))
 [ "${BALLOONTEST_LEGACY:-0}" = 1 ] && [ "$baseline" = 0 ] && balloon=legacy
-L4H_BALLOON=$balloon L4H_MEM=${L4H_MEM:-4G} \
+L4H_CONFIG="$out/balloontest.conf" L4H_BALLOON=$balloon L4H_MEM=${L4H_MEM:-4G} \
     "$l4h_qemu" "$root/host/target/$l4h_target/$l4h_profile/l4h-root.elf" </dev/null >"$log" 2>&1 &
 qemu=$!
 trap 'kill $qemu 2>/dev/null || true' EXIT

@@ -4,9 +4,11 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=$root/build/rtctest-${L4H_ARCH:-x86_64}
 mkdir -p "$out"
-rustc +stable --edition=2024 --test "$root/tests/rtc.rs" -o "$out/unit-tests"
-"$out/unit-tests"
-if [ "${1:-}" = --qemu ]; then
+if [ "${1:-}" != --qemu-only ]; then
+    rustc +stable --edition=2024 --test "$root/tests/rtc.rs" -o "$out/unit-tests"
+    "$out/unit-tests"
+fi
+if [ "${1:-}" = --qemu ] || [ "${1:-}" = --qemu-only ]; then
     source "$root/tools/guest-env.sh"
     if [ -z "${L4H_GUEST_KERNEL:-}" ]; then
         "$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1

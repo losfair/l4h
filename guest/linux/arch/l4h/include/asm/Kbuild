@@ -28,6 +28,7 @@ generic-y += qrwlock.h
 
 ifeq ($(SUBARCH),aarch64)
 generic-y += asm-offsets.h bitops.h bitsperlong.h checksum.h div64.h early_ioremap.h ioctl.h kmap_size.h linkage.h local.h local64.h mmzone.h param.h resource.h rqspinlock.h rwonce.h serial.h shmparam.h statfs.h string.h user.h word-at-a-time.h
+generated-y += cpucap-defs.h sysreg-defs.h
 endif
 
 ifneq ($(SUBARCH),aarch64)

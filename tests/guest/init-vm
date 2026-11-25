@@ -34,7 +34,11 @@ case " $(cat /proc/cmdline) " in
     echo "GUEST: dma check start"
     for i in $(seq 1 10); do
         sleep 2
-        n=$(tr -d '\000' < /tmp/z/fill | wc -c)
+        if [ -x /bin/nonzero ]; then
+            n=$(/bin/nonzero /tmp/z/fill)
+        else
+            n=$(tr -d '\000' < /tmp/z/fill | wc -c)
+        fi
         [ "$n" = 0 ] || break
     done
     echo "GUEST: stale bytes $n"

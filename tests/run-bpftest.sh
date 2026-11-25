@@ -12,10 +12,12 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/guest-env.sh"
 out=$root/build/guest/bpf
 mkdir -p "$out"
-echo 'obj-m += test_bpf.o' >"$out/Makefile"
-cp "$root/build/linux-6.18/lib/test_bpf.c" "$out/"
-"$root/tools/build-linux.sh" vmlinux modules >"$root/build/linux-build.log" 2>&1
-"$root/tools/build-linux.sh" M="$out" modules >"$root/build/bpf-build.log" 2>&1
+if [[ ${L4H_PREBUILT:-0} != 1 && ${L4H_PREBUILT:-0} != guest ]] || [ ! -f "$out/test_bpf.ko" ]; then
+    echo 'obj-m += test_bpf.o' >"$out/Makefile"
+    cp "$root/build/linux-6.18/lib/test_bpf.c" "$out/"
+    "$root/tools/build-linux.sh" vmlinux modules >"$root/build/linux-build.log" 2>&1
+    "$root/tools/build-linux.sh" M="$out" modules >"$root/build/bpf-build.log" 2>&1
+fi
 "$l4h_cc" -O2 -static -o "$out/bpftest" "$root/tests/guest/bpftest.c"
 "$root/tools/mkinitramfs.sh" "$out/bpftest.cpio.gz" "$root/tests/guest/init-bpftest" \
     "$out/test_bpf.ko" "$out/bpftest" >/dev/null

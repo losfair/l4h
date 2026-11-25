@@ -20,6 +20,6 @@ if [ ${#mods[@]} -eq 0 ]; then
     echo "$elf"
     exit 0
 fi
-out=${elf%.elf}-dom0.elf
+out=${L4H_MODULES_OUT:-${elf%.elf}-dom0.elf}
 "$root/tools/add-modules.py" "$elf" "$out" "${mods[@]}" >&2
 echo "$out"

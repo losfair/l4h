@@ -10,6 +10,12 @@ export SEL4_PREFIX=${SEL4_PREFIX:-$root/build/sel4-aarch64}
 export CC_aarch64_sel4=aarch64-linux-gnu-gcc CC_aarch64_sel4_roottask=aarch64-linux-gnu-gcc
 # The cargo profile, as for tools/build-host.sh.
 source "$root/tools/host-profile.sh"
+if [ "${L4H_PREBUILT:-0}" = 1 ] && [ "$#" -eq 0 ] && [ -z "${L4H_EXTRA_DRIVERS:-}" ] &&
+   [ "${L4H_TEST_VMM_BUSY:-0}" != 1 ] &&
+   { [ "${L4H_TEST_INJECT:-0}" != 1 ] || [ "${L4H_PREBUILT_INJECT:-0}" = 1 ]; } &&
+   [ -f "$root/host/target/aarch64-sel4-roottask/$l4h_profile/l4h-root.elf" ]; then
+    exit 0
+fi
 out=$root/host/target/aarch64-sel4/$l4h_profile
 mkdir -p "$out/stripped"
 strip() {

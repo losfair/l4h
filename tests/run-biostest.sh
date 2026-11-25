@@ -12,7 +12,7 @@ mkdir -p "$out"
 "$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
     || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
 "$root/tools/build-sdk.sh" >/dev/null
-(cd "$root/tools/l4hctl" && cargo +stable build -q --release)
+"$root/tools/build-l4hctl.sh"
 "$root/tools/mkinitramfs.sh" "$out/bios.cpio.gz" "$root/tests/guest/init-image" \
     "$root/tools/l4hctl/target/release/l4hctl" "$root/tests/guest/udhcpc.script" >/dev/null
 env -u L4H_DOM0_DISKS -u L4H_DOM0_CMDLINE "$root/tools/build-host.sh"
@@ -34,8 +34,8 @@ qemu=$!
 python3 "$root/tests/dashboard-qemu.py" "$log" "$qmp" &
 screen=$!
 while kill -0 "$qemu" 2>/dev/null; do
-    grep -aq "IMAGETEST: done\|l4h-vmmgr: all guests stopped" "$log" && { sleep 1; kill "$qemu"; break; }
-    sleep 1
+    grep -aq "IMAGETEST: done\|l4h-vmmgr: all guests stopped" "$log" && { sleep 0.2; kill "$qemu"; break; }
+    sleep 0.2
 done
 wait "$qemu" 2>/dev/null || true
 rm -f "$qmp"

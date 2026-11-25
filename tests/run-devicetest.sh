@@ -304,10 +304,8 @@ rustc +stable --edition=2024 --test --crate-name l4h_host -L dependency="$out" \
     "$root/host/l4h-host/src/lib.rs" -o "$out/host-tests"
 "$out/host-tests"
 if [ "${1:-}" = --qemu ]; then
-    if [ "${L4H_ARCH:-x86_64}" = x86_64 ]; then
-        "$root/tests/run-vmmfairtest.sh"
-        "$root/tests/run-vmmguardtest.sh"
-    fi
+    # Run the normal-host console stress before run-vmmguardtest.sh, which
+    # rebuilds the host with L4H_TEST_INJECT=1 L4H_TEST_VMM_BUSY=1.
     # shellcheck source=tools/guest-env.sh
     source "$root/tools/guest-env.sh"
     "$l4h_cc" -O2 -Wall -Wextra -Werror -static "$root/tests/guest/console-stress.c" -o "$out/console-stress"
@@ -318,4 +316,8 @@ if [ "${1:-}" = --qemu ]; then
         exit 1
     fi
     echo 'CONSOLETEST: PASS (QEMU, continuous console output and RTC hypercalls)'
+    if [ "${L4H_ARCH:-x86_64}" = x86_64 ]; then
+        "$root/tests/run-vmmfairtest.sh"
+        "$root/tests/run-vmmguardtest.sh"
+    fi
 fi

@@ -10,7 +10,12 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 rootserver=$("$root/tools/dom0-modules.sh" "$1"); shift
 # Test a shipped kernel variant with the same host and guest binaries.
 sel4=$root/build/sel4${L4H_KERNEL_VARIANT:+-$L4H_KERNEL_VARIANT}
-objcopy -O elf32-i386 "$sel4/bin/kernel.elf" "$root/build/kernel32.elf"
+kernel32=$sel4/bin/kernel32.elf
+if [ ! -f "$kernel32" ] || [ "$sel4/bin/kernel.elf" -nt "$kernel32" ]; then
+    tmp=$(mktemp "$sel4/bin/kernel32.elf.XXXXXX")
+    objcopy -O elf32-i386 "$sel4/bin/kernel.elf" "$tmp"
+    mv -f "$tmp" "$kernel32"
+fi
 # l4h reports its free memory to QEMU, which then drops it
 # (L4H_BALLOON=0 leaves the device out, L4H_BALLOON=legacy makes it a
 # legacy-only device).
@@ -41,5 +46,5 @@ exec qemu-system-x86_64 \
     -enable-kvm -cpu "${L4H_QEMU_CPU:-host,-vmx,-svm,+invtsc}" \
     -smp "${L4H_SMP:-4}" -m "${L4H_MEM:-4G}" \
     -nographic -serial mon:stdio -no-reboot "${iommu[@]}" \
-    -kernel "$root/build/kernel32.elf" \
+    -kernel "$kernel32" \
     -initrd "$rootserver" "${balloon[@]}" "$@"

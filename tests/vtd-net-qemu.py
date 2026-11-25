@@ -14,10 +14,12 @@ has it) and report the switch's ports, which have none. With AMD-Vi on QEMU
 this is not yet understood.
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,7 +27,7 @@ from host_profile import root_elf  # noqa: E402
 OUT = ROOT / "build/vtdtest"
 
 
-def devices(topology, platform, taps, controllers):
+def devices(topology, platform, taps, controllers, disk_dir):
     bridge, bus = [], "pcie.0"
     if topology in ("pci", "nested-pci"):
         bridge = ["-device", "i82801b11-bridge,id=pci.1,bus=pcie.0,addr=0x1e"]
@@ -58,7 +60,7 @@ def devices(topology, platform, taps, controllers):
                    f"virtio-net-pci,netdev=n{n},bus={port(n)[0]},addr={port(n)[1]},"
                    f"mac=52:54:00:12:34:{n + 1:02x},iommu_platform={platform}{modern}"]
     for n in range(controllers):
-        bridge += ["-drive", f"file={OUT / f'net-disk{n}.raw'},if=none,id=d{n},format=raw",
+        bridge += ["-drive", f"file={disk_dir / f'net-disk{n}.raw'},if=none,id=d{n},format=raw",
                    "-device", f"virtio-blk-pci,drive=d{n},bus={port(n + 2)[0]},addr={port(n + 2)[1]},disable-legacy=on"]
     return bridge
 
@@ -70,33 +72,39 @@ def run(topology, platform, taps, env, controllers, intremap):
     if not intremap:
         name += "-no-intremap"
     log = OUT / f"{name}.log"
-    with log.open("w") as output:
-        proc = subprocess.Popen([
-            str(ROOT / "tools/run-qemu.sh"),
-            str(root_elf()),
-            *devices(topology, platform, taps, controllers),
-        ], env=env, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
-        try:
-            deadline = time.monotonic() + 240
-            while proc.poll() is None and time.monotonic() < deadline:
+    with tempfile.TemporaryDirectory(prefix=f"l4h-vtdnet-{name}-") as tmp:
+        work = Path(tmp)
+        for n in range(controllers):
+            with (work / f"net-disk{n}.raw").open("wb") as disk:
+                disk.truncate(16 << 20)
+        case_env = dict(env, L4H_MODULES_OUT=str(work / "l4h-root-dom0.elf"))
+        with log.open("w") as output:
+            proc = subprocess.Popen([
+                str(ROOT / "tools/run-qemu.sh"),
+                str(root_elf()),
+                *devices(topology, platform, taps, controllers, work),
+            ], env=case_env, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
+            try:
+                deadline = time.monotonic() + 240
+                while proc.poll() is None and time.monotonic() < deadline:
+                    text = log.read_text(errors="replace")
+                    if "VTDNET: PASS" in text or "VTDNET: FAIL" in text or "panicked" in text:
+                        break
+                    time.sleep(0.1)
                 text = log.read_text(errors="replace")
-                if "VTDNET: PASS" in text or "VTDNET: FAIL" in text or "panicked" in text:
-                    break
-                time.sleep(0.1)
-            text = log.read_text(errors="replace")
-            assert "VTDNET: PASS" in text, f"{name} failed; see {log}"
-            count = re.search(r"devices:\s+(\d+) confined", text)
-            assert count and int(count[1]) >= controllers + 2, f"not all devices attached; see {log}"
-            assert "VT-d 0:" not in text, f"IOMMU fault; see {log}"
-            if topology == "pcie-switch":
-                assert re.search(r"pci 00:05\.0: ACS SV TB RR CR UF", text), f"ACS not on in the root port; see {log}"
-                open_ports = re.findall(r"switch downstream port has no ACS", text)
-                assert len(open_ports) == controllers + 2, f"ACS-less switch ports not all reported; see {log}"
-            print(f"VTDNET: {name} PASS", flush=True)
-        finally:
-            if proc.poll() is None:
-                proc.terminate()
-            proc.wait(timeout=10)
+                assert "VTDNET: PASS" in text, f"{name} failed; see {log}"
+                count = re.search(r"devices:\s+(\d+) confined", text)
+                assert count and int(count[1]) >= controllers + 2, f"not all devices attached; see {log}"
+                assert "VT-d 0:" not in text, f"IOMMU fault; see {log}"
+                if topology == "pcie-switch":
+                    assert re.search(r"pci 00:05\.0: ACS SV TB RR CR UF", text), f"ACS not on in the root port; see {log}"
+                    open_ports = re.findall(r"switch downstream port has no ACS", text)
+                    assert len(open_ports) == controllers + 2, f"ACS-less switch ports not all reported; see {log}"
+                print(f"VTDNET: {name} PASS", flush=True)
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+                proc.wait(timeout=10)
 
 
 def main():
@@ -119,14 +127,9 @@ def main():
     subprocess.run([ROOT / "tools/mkinitramfs.sh", peer, ROOT / "tests/guest/init-vtd-netvm"], check=True)
     subprocess.run([ROOT / "tools/mkinitramfs.sh", initrd, ROOT / "tests/guest/init-vtd-net",
                     ROOT / "tools/l4hctl/target/release/l4hctl", peer, expected], check=True)
-    for n in range(args.controllers):
-        with (OUT / f"net-disk{n}.raw").open("wb") as disk:
-            disk.truncate(16 << 20)
     config = OUT / "net.conf"
     config.write_text(f"dom0_mem_mb=256\ndom0_disks=0\nwatchdog_secs=0\niommu=1\niommu_intremap={int(not args.no_intremap)}\n")
-    env = dict(os.environ, L4H_QEMU_IOMMU=args.iommu, L4H_MEM="8G", L4H_SMP="4",
-               L4H_DOM0_INITRD=str(initrd), L4H_CONFIG=str(config), L4H_GUEST_SDK="")
-    env.setdefault("L4H_GUEST_KERNEL", str(ROOT / "build/linux-l4h/vmlinux.stripped"))
+    cases = []
     for topology, platform in [("root", "on"), ("pci", "on"), ("pci", "off"),
                                ("pcie-pci", "on"), ("pcie-pci", "off"),
                                ("nested-pci", "on"), ("nested-pci", "off"),
@@ -136,7 +139,21 @@ def main():
             print(f"VTDNET: net-{topology}-{platform} skipped with AMD-Vi (--topology {topology} runs it)", flush=True)
             continue
         if args.topology is None or topology == args.topology:
+            cases.append((topology, platform))
+    workers = 1 if args.tap else int(os.environ.get("VTDNET_JOBS", min(len(cases), max(1, (os.cpu_count() or 1) // 2))))
+    smp = "2" if workers > 1 else "4"
+    env = dict(os.environ, L4H_QEMU_IOMMU=args.iommu, L4H_MEM="8G", L4H_SMP=smp,
+               L4H_DOM0_INITRD=str(initrd), L4H_CONFIG=str(config), L4H_GUEST_SDK="")
+    env.setdefault("L4H_GUEST_KERNEL", str(ROOT / "build/linux-l4h/vmlinux.stripped"))
+    if workers <= 1:
+        for topology, platform in cases:
             run(topology, platform, args.tap, env, args.controllers, not args.no_intremap)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(run, topology, platform, args.tap, env, args.controllers, not args.no_intremap)
+                       for topology, platform in cases]
+            for fut in futures:
+                fut.result()
 
 
 if __name__ == "__main__":

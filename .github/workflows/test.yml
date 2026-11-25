@@ -1,6 +1,7 @@
-# Build l4h and run its integration tests in QEMU.  KVM serves only as a
-# fast CPU (the scripts hide VMX from the machine, as on a cloud VM), so the
-# standard GitHub-hosted Linux runners, which expose /dev/kvm, suffice.
+# Build l4h once per architecture and run its integration tests in parallel
+# QEMU shards.  KVM serves only as a fast CPU (the scripts hide VMX from the
+# machine, as on a cloud VM), so the standard GitHub-hosted Linux runners,
+# which expose /dev/kvm, suffice.
 # Jobs run in Debian 13 containers, the distribution l4h is developed on;
 # tools/ci-setup.sh installs everything else.
 name: test
@@ -44,10 +45,10 @@ jobs:
       - name: Shell lint, every script (errors, and "!" checks that set -e ignores)
         run: tools/lint-shell.sh
 
-  x86_64:
-    name: x86_64 (QEMU/KVM)
+  build-x86_64:
+    name: x86_64 build & unit tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 45
     container:
       image: debian:trixie
       options: --device /dev/kvm
@@ -66,6 +67,14 @@ jobs:
           path: .ccache
           key: ccache-x86_64-${{ github.sha }}
           restore-keys: ccache-x86_64-
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.cargo/bin/bindgen
+          key: cargo-x86_64-${{ hashFiles('**/Cargo.lock', 'tools/ci-setup.sh') }}
+          restore-keys: cargo-x86_64-
       - name: Set up
         run: tools/ci-setup.sh x86_64
       - name: Check KVM
@@ -86,6 +95,11 @@ jobs:
         run: tests/run-acstest.sh
       - name: Guest provider bootstrap validation
         run: tests/run-providercheck.sh
+      - name: RTC, VT-d and partition ring unit tests
+        run: |
+          tests/run-rtctest.sh
+          tests/run-vtdtest.sh
+          tests/run-ringtest.sh
       - name: Build seL4
         run: tools/build-kernel.sh
       - name: KVM TSC calibration and boot buffer lifetime
@@ -101,18 +115,81 @@ jobs:
         run: tests/run-vtxtest.sh off
       - name: CPU topology and migration policy
         run: tests/run-schedtest.sh
-      - name: Build Linux
-        run: tools/build-linux.sh vmlinux && ccache -s
+      - name: Build Linux, SDK, test modules, HVM guest kernel, l4hctl, host and mkshim
+        run: |
+          tools/build-linux.sh vmlinux modules && ccache -s
+          tools/build-sdk.sh
+          tools/build-test-modules.sh
+          tools/build-linux-hvm.sh >/dev/null
+          tools/build-l4hctl.sh
+          tests/build-flagstest.sh
+          tools/build-host.sh
+          tools/build-mkshim.sh 2
+      - name: Pack prebuilt x86_64 stack
+        run: |
+          objcopy --strip-debug build/linux-l4h/vmlinux build/linux-l4h/vmlinux.stripped
+          stage=$(mktemp -d)
+          mkdir -p "$stage/build/linux-l4h"
+          cp build/linux-l4h/vmlinux.stripped "$stage/build/linux-l4h/vmlinux"
+          cp build/linux-l4h/vmlinux.stripped "$stage/build/linux-l4h/vmlinux.stripped"
+          cp build/linux-l4h/sdk.erofs build/linux-l4h/.config "$stage/build/linux-l4h/"
+          tar -cf build/prebuilt-x86_64.tar \
+            -C "$stage" build/linux-l4h \
+            -C "$PWD" \
+            build/sel4 \
+            build/kernel/kernel.elf \
+            build/mkshim \
+            build/guest/flags-test build/guest/flagsvm.cpio.gz \
+            build/guest/page-aging/l4h_page_aging.ko \
+            build/guest/pvlock/l4h_pvlock.ko \
+            build/guest/bpf/test_bpf.ko \
+            build/usbtest/mod/usbabuse.ko \
+            build/logtest/mod/l4h_log_fault.ko \
+            build/linux-hvm/arch/x86/boot/bzImage \
+            host/target/x86_64-sel4-roottask/debug/l4h-root.elf \
+            tools/l4hctl/target/release/l4hctl
+          rm -rf "$stage"
+          ls -lh build/prebuilt-x86_64.tar
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: prebuilt-x86_64
+          path: build/prebuilt-x86_64.tar
+          retention-days: 1
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: logs-build-x86_64
+          path: |
+            build/*.log
+            build/*/*.log
+
+  x86_64-core:
+    name: x86_64 core, memory & scheduler (QEMU/KVM)
+    needs: build-x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container:
+      image: debian:trixie
+      options: --device /dev/kvm
+    env:
+      L4H_PREBUILT: '1'
+    steps:
+      - name: Install git
+        run: apt-get update -q && apt-get install -y -q --no-install-recommends git ca-certificates
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          submodules: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: prebuilt-x86_64
+          path: build
+      - name: Unpack prebuilt stack
+        run: tar -xf build/prebuilt-x86_64.tar && rm -f build/prebuilt-x86_64.tar
+      - name: Set up
+        run: tools/ci-setup.sh x86_64-run
       - name: RTC updates and new guest clocks
-        run: tests/run-rtctest.sh --qemu
-      - name: Console rings, hotplug scheduling and hypercalls under console load
-        run: tests/run-devicetest.sh --qemu
-      - name: Retained host logs and serial output in release mode
-        run: L4H_RELEASE=1 tests/run-logtest.sh
-      - name: Serial output when components, l4h-logd or root fail
-        run: tests/run-logdtest.sh
-      - name: A driver that stops answering leaves root and the rest running
-        run: tests/run-hangtest.sh
+        run: tests/run-rtctest.sh --qemu-only
       - name: Guest ABI and seL4 extensions
         run: tests/run-abitest.sh
       - name: Boot RAM clearing and initial user context
@@ -123,6 +200,169 @@ jobs:
         run: tests/run-selftest.sh 4
       - name: Guest FUSE (shared mappings, locks, WAL)
         run: tests/run-fusetest.sh 4
+      - name: Transparent huge pages, 1 and 4 vCPUs
+        run: tests/run-thptest.sh 1 && tests/run-thptest.sh 4
+      - name: THP memory hotplug and revocation
+        run: HPSTRESS_THP=1 tests/run-hotplugstress.sh 15
+      - name: AArch64 userspace on x86_64 (kemu)
+        run: tests/run-kemutest.sh 4
+      - name: Guest RAM blocks (conversion, smp_mm_stress, OOM)
+        run: tests/run-objtest.sh
+      - name: BPF JIT
+        run: tests/run-bpftest.sh
+      - name: Android kernel features
+        run: tests/run-androidtest.sh
+      - name: Display (virtio-gpu)
+        run: tests/run-gputest.sh
+      - name: dom0 restart, CPU caps, steal time
+        run: tests/run-m6test.sh
+      - name: Paravirtual spinlocks
+        run: tests/run-pvlocktest.sh
+      - name: SMT discovery, placement and migration
+        run: tests/run-smttest.sh
+      - name: Resource limits
+        run: tests/run-limits.sh
+      - name: Guest memory overhead and lifecycle latency
+        run: |
+          tests/run-vmbench.sh | tee build/vmbench.txt
+          { echo '### Guest memory overhead and lifecycle latency'; echo '```';
+            sed 's/^VMBENCH: //' build/vmbench.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Serial monitor
+        run: tests/run-monitor.sh
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: logs-x86_64-core
+          path: |
+            build/*.log
+            build/*/*.log
+
+  x86_64-devices:
+    name: x86_64 devices, control & network (QEMU/KVM)
+    needs: build-x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container:
+      image: debian:trixie
+      options: --device /dev/kvm
+    env:
+      L4H_PREBUILT: '1'
+    steps:
+      - name: Install git
+        run: apt-get update -q && apt-get install -y -q --no-install-recommends git ca-certificates
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: prebuilt-x86_64
+          path: build
+      - name: Unpack prebuilt stack
+        run: tar -xf build/prebuilt-x86_64.tar && rm -f build/prebuilt-x86_64.tar
+      - name: Set up
+        run: tools/ci-setup.sh x86_64-run
+      - name: USB controller assignment (xHCI, MSI-X and MSI)
+        run: tests/run-usbtest.sh && USBTEST_HC=nec tests/run-usbtest.sh
+      - name: Block pass-through (virtio-blk)
+        run: tests/run-blktest.sh
+      - name: Block pass-through (NVMe and AHCI SATA)
+        run: |
+          BLKTEST_DEV=nvme tests/run-blktest.sh
+          BLKTEST_DEV=nvme-namespaces tests/run-blktest.sh
+          BLKTEST_DEV=ahci-disks tests/run-blktest.sh
+      - name: Legacy (virtio 0.9.5) virtio-blk and virtio-scsi
+        run: BLKTEST_DEV=virtio-legacy tests/run-blktest.sh && BLKTEST_DEV=scsi-legacy tests/run-blktest.sh
+      - name: Control API
+        run: tests/run-ctltest.sh
+      - name: Network
+        run: tests/run-nettest.sh
+      - name: Network over a legacy virtio-net uplink
+        run: NETTEST_LEGACY=1 tests/run-nettest.sh
+      - name: Intel 82574L driver, confined behind the Intel and AMD IOMMUs
+        run: tests/run-e1000etest.sh && L4H_QEMU_IOMMU=intel tests/run-e1000etest.sh && L4H_QEMU_IOMMU=amd tests/run-e1000etest.sh
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: logs-x86_64-devices
+          path: |
+            build/*.log
+            build/*/*.log
+
+  x86_64-iommu-mk:
+    name: x86_64 IOMMU & multikernel (QEMU/KVM)
+    needs: build-x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container:
+      image: debian:trixie
+      options: --device /dev/kvm
+    env:
+      L4H_PREBUILT: '1'
+    steps:
+      - name: Install git
+        run: apt-get update -q && apt-get install -y -q --no-install-recommends git ca-certificates
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: prebuilt-x86_64
+          path: build
+      - name: Unpack prebuilt stack
+        run: tar -xf build/prebuilt-x86_64.tar && rm -f build/prebuilt-x86_64.tar
+      - name: Set up
+        run: tools/ci-setup.sh x86_64-run
+      - name: Intel VT-d DMA and interrupt remapping
+        run: tests/run-vtdtest.sh --qemu-only
+      - name: Multikernel partitions through UEFI (PCI through ECAM)
+        run: MK_BOOT=uefi tests/run-mktest.sh
+      - name: Multikernel partitions without MCFG (shared PCI ports)
+        run: MK_MACHINE=pc tests/run-mktest.sh
+      - name: Multikernel partitions sharing VT-d
+        run: L4H_QEMU_IOMMU=intel tests/run-mktest.sh
+      - name: AMD-Vi shared PCI requester groups
+        run: |
+          python3 tests/vtd-net-qemu.py --iommu amd --topology pci
+          python3 tests/vtd-net-qemu.py --iommu amd --topology pci --no-intremap
+          python3 tests/vtd-net-qemu.py --iommu amd --topology pci --controllers 17
+          python3 tests/amdvi-qemu.py
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: logs-x86_64-iommu-mk
+          path: |
+            build/*.log
+            build/*/*.log
+
+  x86_64-boot-attest:
+    name: x86_64 boot, attestation & nested virt (QEMU/KVM)
+    needs: build-x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container:
+      image: debian:trixie
+      options: --device /dev/kvm
+    env:
+      L4H_PREBUILT: '1'
+    steps:
+      - name: Install git
+        run: apt-get update -q && apt-get install -y -q --no-install-recommends git ca-certificates
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: prebuilt-x86_64
+          path: build
+      - name: Unpack prebuilt stack
+        run: tar -xf build/prebuilt-x86_64.tar && rm -f build/prebuilt-x86_64.tar
+      - name: Set up
+        run: tools/ci-setup.sh x86_64-run
+      - name: UEFI boot image
+        run: tests/run-uefitest.sh
+      - name: A/B EFI slots, growing disk windows and PCI inventory
+        run: tests/run-platformtest.sh
+      - name: BIOS boot of the same image
+        run: tests/run-biostest.sh
+      - name: Attestation (software TPM)
+        run: tests/run-attesttest.sh
       # VCPUs exist only when the CPU has VT-x or AMD-V (SVM), which needs a
       # runner whose KVM allows nesting.  Hosted runners vary, so the step
       # runs where it can and says so where it cannot.
@@ -146,7 +386,7 @@ jobs:
             tests/run-vcpustress.sh || vcpustress=failed
             echo "vcpustress=$vcpustress" >> "$GITHUB_OUTPUT"
             if [ "$vcpustress" = failed ]; then
-              echo "::warning::VCPUSTRESS failed on $model (not fatal for now; see logs-x86_64)"
+              echo "::warning::VCPUSTRESS failed on $model (not fatal for now; see logs-x86_64-boot-attest)"
             fi
             L4H_QEMU_CPU=host,+invtsc tests/run-selftest.sh 1
             if grep -q "$virt: unavailable" build/qemu.log; then
@@ -170,8 +410,48 @@ jobs:
             echo "::warning::No nested virtualization on this runner ($model, nested: $nested): the $name path was not tested"
             echo "$name exposed: **not tested**, no nested virtualization on this runner ($model, KVM nested: $nested)" >> "$GITHUB_STEP_SUMMARY"
           fi
-      - name: Transparent huge pages, 1 and 4 vCPUs
-        run: tests/run-thptest.sh 1 && tests/run-thptest.sh 4
+      - name: Upload logs
+        if: failure() || steps.nested_virt.outputs.vcpustress == 'failed'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: logs-x86_64-boot-attest
+          path: |
+            build/*.log
+            build/*/*.log
+
+  x86_64-variants:
+    name: x86_64 variants & fuzz (QEMU/KVM)
+    needs: build-x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container:
+      image: debian:trixie
+      options: --device /dev/kvm
+    env:
+      L4H_PREBUILT: guest
+    steps:
+      - name: Install git
+        run: apt-get update -q && apt-get install -y -q --no-install-recommends git ca-certificates
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          submodules: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: prebuilt-x86_64
+          path: build
+      - name: Unpack prebuilt stack
+        run: tar -xf build/prebuilt-x86_64.tar && rm -f build/prebuilt-x86_64.tar
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-x86_64-${{ hashFiles('**/Cargo.lock', 'tools/ci-setup.sh') }}
+          restore-keys: cargo-x86_64-
+      - name: Set up
+        run: tools/ci-setup.sh x86_64-host
+      - name: Virtqueue fuzzing
+        run: tests/run-fuzz.sh
       - name: Transparent huge pages and guest ABI on the xapic-nopcid kernel
         run: |
           L4H_KERNEL_VARIANT=xapic-nopcid L4H_LAPIC_MODE=XAPIC L4H_PCID=OFF tools/build-kernel.sh
@@ -179,91 +459,109 @@ jobs:
           export L4H_QEMU_CPU=host,-vmx,-svm,+invtsc,-pcid,-invpcid,-x2apic
           tests/run-thptest.sh 4
           tests/run-abitest.sh
-      - name: THP memory hotplug and revocation
-        run: HPSTRESS_THP=1 tests/run-hotplugstress.sh 15
       - name: SKIM isolation and Linux ABI on Meltdown-affected CPU profiles
         run: tests/run-skimtest.sh
-      - name: AArch64 userspace on x86_64 (kemu)
-        run: tests/run-kemutest.sh 4
-      - name: Guest RAM blocks (conversion, smp_mm_stress, OOM)
-        run: tests/run-objtest.sh
-      - name: BPF JIT
-        run: tests/run-bpftest.sh
-      - name: Android kernel features
-        run: tests/run-androidtest.sh
-      - name: Display (virtio-gpu)
-        run: tests/run-gputest.sh
-      - name: USB controller assignment (xHCI, MSI-X and MSI)
-        run: tests/run-usbtest.sh && USBTEST_HC=nec tests/run-usbtest.sh
-      - name: Block pass-through (virtio-blk)
-        run: tests/run-blktest.sh
-      - name: Block pass-through (NVMe and AHCI SATA)
-        run: |
-          BLKTEST_DEV=nvme tests/run-blktest.sh
-          BLKTEST_DEV=nvme-namespaces tests/run-blktest.sh
-          BLKTEST_DEV=ahci-disks tests/run-blktest.sh
-      - name: Legacy (virtio 0.9.5) virtio-blk and virtio-scsi
-        run: BLKTEST_DEV=virtio-legacy tests/run-blktest.sh && BLKTEST_DEV=scsi-legacy tests/run-blktest.sh
-      - name: Control API
-        run: tests/run-ctltest.sh
-      - name: Network
-        run: tests/run-nettest.sh
-      - name: Network over a legacy virtio-net uplink
-        run: NETTEST_LEGACY=1 tests/run-nettest.sh
+      - name: Retained host logs and serial output in release mode
+        run: L4H_RELEASE=1 tests/run-logtest.sh
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: logs-x86_64-variants
+          path: |
+            build/*.log
+            build/*/*.log
+
+  x86_64-faults:
+    name: x86_64 fault injection & no-VTX (QEMU/KVM)
+    needs: build-x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container:
+      image: debian:trixie
+      options: --device /dev/kvm
+    env:
+      L4H_PREBUILT: guest
+    steps:
+      - name: Install git
+        run: apt-get update -q && apt-get install -y -q --no-install-recommends git ca-certificates
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          submodules: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: prebuilt-x86_64
+          path: build
+      - name: Unpack prebuilt stack
+        run: tar -xf build/prebuilt-x86_64.tar && rm -f build/prebuilt-x86_64.tar
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-x86_64-${{ hashFiles('**/Cargo.lock', 'tools/ci-setup.sh') }}
+          restore-keys: cargo-x86_64-
+      - name: Set up
+        run: tools/ci-setup.sh x86_64-host
+      - name: Console rings, hotplug scheduling and hypercalls under console load
+        run: tests/run-devicetest.sh --qemu
+      # Group L4H_TEST_INJECT=1 tests together to avoid flipping the host build back and forth.
+      - name: Serial output when components, l4h-logd or root fail
+        run: tests/run-logdtest.sh
+      - name: A driver that stops answering leaves root and the rest running
+        run: tests/run-hangtest.sh
       - name: NIC drivers outside netd (faults, hangs, restarts)
         run: tests/run-nictest.sh && L4H_QEMU_IOMMU=intel tests/run-nictest.sh
-      - name: Intel 82574L driver, confined behind the Intel and AMD IOMMUs
-        run: tests/run-e1000etest.sh && L4H_QEMU_IOMMU=intel tests/run-e1000etest.sh && L4H_QEMU_IOMMU=amd tests/run-e1000etest.sh
       - name: NIC firmware loaded by dom0 (confined drivers only)
         run: tests/run-nicfwtest.sh && L4H_QEMU_IOMMU=intel tests/run-nicfwtest.sh
-      - name: Intel VT-d DMA and interrupt remapping
-        run: tests/run-vtdtest.sh --qemu
-      - name: Partition message rings
-        run: tests/run-ringtest.sh
-      - name: Multikernel partitions through UEFI (PCI through ECAM)
-        run: MK_BOOT=uefi tests/run-mktest.sh
-      - name: Multikernel partitions without MCFG (shared PCI ports)
-        run: MK_MACHINE=pc tests/run-mktest.sh
-      - name: Multikernel partitions sharing VT-d
-        run: L4H_QEMU_IOMMU=intel tests/run-mktest.sh
-      - name: AMD-Vi shared PCI requester groups
-        run: |
-          python3 tests/vtd-net-qemu.py --iommu amd --topology pci
-          python3 tests/vtd-net-qemu.py --iommu amd --topology pci --no-intremap
-          python3 tests/vtd-net-qemu.py --iommu amd --topology pci --controllers 17
-          python3 tests/amdvi-qemu.py
-      - name: dom0 restart, CPU caps, steal time
-        run: tests/run-m6test.sh
-      - name: Paravirtual spinlocks
-        run: tests/run-pvlocktest.sh
-      - name: SMT discovery, placement and migration
-        run: tests/run-smttest.sh
-      - name: Resource limits
-        run: tests/run-limits.sh
-      - name: Guest memory overhead and lifecycle latency
-        run: |
-          tests/run-vmbench.sh | tee build/vmbench.txt
-          { echo '### Guest memory overhead and lifecycle latency'; echo '```';
-            sed 's/^VMBENCH: //' build/vmbench.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-      - name: Serial monitor
-        run: tests/run-monitor.sh
-      - name: UEFI boot image
-        run: tests/run-uefitest.sh
-      - name: A/B EFI slots, growing disk windows and PCI inventory
-        run: tests/run-platformtest.sh
-      - name: BIOS boot of the same image
-        run: tests/run-biostest.sh
-      - name: Attestation (software TPM)
-        run: tests/run-attesttest.sh
-      - name: Virtqueue fuzzing
-        run: tests/run-fuzz.sh
       - name: Userspace without kernel VT-x/AMD-V support
         run: tests/run-novtxtest.sh
-      - name: FL4 Linux, devices, networking, balloon, ABI and nested KVM when available
-        run: L4H_RELEASE=1 tests/run-fl4test.sh | tee build/fl4test.log
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: logs-x86_64-faults
+          path: |
+            build/*.log
+            build/*/*.log
+
+  x86_64-fl4:
+    name: x86_64 FL4 & UEFI (QEMU/KVM)
+    needs: build-x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container:
+      image: debian:trixie
+      options: --device /dev/kvm
+    env:
+      L4H_PREBUILT: guest
+      L4H_RELEASE: '1'
+    steps:
+      - name: Install git
+        run: apt-get update -q && apt-get install -y -q --no-install-recommends git ca-certificates
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          submodules: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: prebuilt-x86_64
+          path: build
+      - name: Unpack prebuilt stack
+        run: tar -xf build/prebuilt-x86_64.tar && rm -f build/prebuilt-x86_64.tar
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-fl4-${{ hashFiles('**/Cargo.lock', 'kernel/fl4/REVISION', 'tools/ci-setup.sh') }}
+          restore-keys: |
+            cargo-fl4-
+            cargo-x86_64-
+      - name: Set up
+        run: tools/ci-setup.sh x86_64-fl4
+      - name: FL4 Linux, devices, networking, balloon and ABI
+        run: L4H_FL4_KVM=0 tests/run-fl4test.sh | tee build/fl4test.log
       - name: UEFI boot of the FL4 application
-        env:
-          L4H_RELEASE: '1'
         run: |
           # Package the binaries already built by run-fl4test.sh.
           tools/mkfl4-release-efi.sh build/l4h-fl4.efi
@@ -272,48 +570,89 @@ jobs:
           grep -aq "IMAGETEST: SDK mounted" build/qemu-uefi.log
           PLATFORM_FL4_EFI=build/l4h-fl4.efi tests/run-platformtest.sh
       - name: Upload logs
-        if: failure() || steps.nested_virt.outputs.vcpustress == 'failed'
+        if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: logs-x86_64
+          name: logs-x86_64-fl4
           path: |
             build/*.log
             build/*/*.log
 
-  debian:
-    name: Debian guests (QEMU/KVM)
+  x86_64-fl4-kvm:
+    name: x86_64 FL4 nested KVM (QEMU/KVM)
+    needs: build-x86_64
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 45
     container:
       image: debian:trixie
-      # debootstrap mounts filesystems in its chroot.  The runner VM is
-      # discarded after the job, so this exposes nothing beyond it.
-      options: --privileged
+      options: --device /dev/kvm
+    env:
+      L4H_PREBUILT: guest
+      L4H_RELEASE: '1'
     steps:
       - name: Install git
         run: apt-get update -q && apt-get install -y -q --no-install-recommends git ca-certificates
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           submodules: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: prebuilt-x86_64
+          path: build
+      - name: Unpack prebuilt stack
+        run: tar -xf build/prebuilt-x86_64.tar && rm -f build/prebuilt-x86_64.tar
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
-          path: build/dl
-          key: linux-${{ env.LINUX_VERSION }}
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
-        with:
-          path: .ccache
-          key: ccache-debian-${{ github.sha }}
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-fl4-${{ hashFiles('**/Cargo.lock', 'kernel/fl4/REVISION', 'tools/ci-setup.sh') }}
           restore-keys: |
-            ccache-debian-
-            ccache-x86_64-
+            cargo-fl4-
+            cargo-x86_64-
       - name: Set up
-        run: tools/ci-setup.sh x86_64 debian
+        run: tools/ci-setup.sh x86_64-fl4
+      - name: FL4 nested KVM (when available)
+        run: L4H_FL4_ONLY=kvm tests/run-fl4test.sh | tee build/fl4test-kvm.log
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: logs-x86_64-fl4-kvm
+          path: |
+            build/*.log
+            build/*/*.log
+
+  debian:
+    name: Debian guests (QEMU/KVM)
+    needs: build-x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container:
+      image: debian:trixie
+      # debootstrap mounts filesystems in its chroot.  The runner VM is
+      # discarded after the job, so this exposes nothing beyond it.
+      options: --privileged
+    env:
+      L4H_PREBUILT: '1'
+    steps:
+      - name: Install git
+        run: apt-get update -q && apt-get install -y -q --no-install-recommends git ca-certificates
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: prebuilt-x86_64
+          path: build
+      - name: Unpack prebuilt stack
+        run: tar -xf build/prebuilt-x86_64.tar && rm -f build/prebuilt-x86_64.tar
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: build/busybox-1.36.1.tar.bz2
+          key: busybox-1.36.1
+      - name: Set up
+        run: tools/ci-setup.sh x86_64-run debian
       - name: Check KVM
         run: test -c /dev/kvm && test -w /dev/kvm
-      - name: Build seL4
-        run: tools/build-kernel.sh
-      - name: Build Linux
-        run: tools/build-linux.sh vmlinux
       - name: Build the Debian image
         run: tests/mkdebian.sh
       - name: Debian with systemd
@@ -331,18 +670,15 @@ jobs:
             build/*.log
             build/*/*.log
 
-  aarch64:
-    name: aarch64 (QEMU/TCG)
+  build-aarch64:
+    name: aarch64 build
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 45
     container:
       image: debian:trixie
     env:
       L4H_ARCH: aarch64
       L4H_LINUX_CC: ccache aarch64-linux-gnu-gcc
-      L4H_TEST_TIMEOUT: 600
-      NETTEST_TIMEOUT: 600
-      CTLTEST_TIMEOUT: 1800
     steps:
       - name: Install git
         run: apt-get update -q && apt-get install -y -q --no-install-recommends git ca-certificates
@@ -358,14 +694,104 @@ jobs:
           path: .ccache
           key: ccache-aarch64-${{ github.sha }}
           restore-keys: ccache-aarch64-
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-aarch64-${{ hashFiles('**/Cargo.lock', 'tools/ci-setup.sh') }}
+          restore-keys: cargo-aarch64-
       - name: Set up
         run: tools/ci-setup.sh aarch64
       - name: Build seL4 and loader
         run: tools/build-kernel-aarch64.sh && tools/build-loader-aarch64.sh
       - name: IPC goes through the wiring and l4h-ipc (clippy)
         run: tests/check-ipc.sh
-      - name: Build Linux
-        run: tools/build-linux.sh vmlinux
+      - name: Build Linux, SDK, test modules, l4hctl and host
+        run: |
+          tools/build-linux.sh vmlinux modules
+          tools/build-sdk.sh
+          tools/build-test-modules.sh
+          tools/build-l4hctl.sh
+          tests/build-flagstest.sh
+          tools/build-host-aarch64.sh
+      - name: Pack prebuilt aarch64 stack (2 GiB and 6 GiB kernel/loader)
+        run: |
+          aarch64-linux-gnu-objcopy --strip-debug build/linux-l4h-aarch64/vmlinux build/linux-l4h-aarch64/vmlinux.stripped
+          mkdir -p build/prebuilt
+          cp host/target/aarch64-sel4-roottask/debug/l4h-root.elf build/prebuilt/l4h-root-default.elf
+          L4H_TEST_INJECT=1 tools/build-host-aarch64.sh
+          cp host/target/aarch64-sel4-roottask/debug/l4h-root.elf build/prebuilt/l4h-root-inject.elf
+          cp build/prebuilt/l4h-root-default.elf host/target/aarch64-sel4-roottask/debug/l4h-root.elf
+          stage=$(mktemp -d)
+          mkdir -p "$stage/build/linux-l4h-aarch64/scripts/basic" "$stage/build/linux-l4h-aarch64/scripts/mod"
+          cp build/linux-l4h-aarch64/vmlinux.stripped "$stage/build/linux-l4h-aarch64/vmlinux"
+          cp build/linux-l4h-aarch64/vmlinux.stripped "$stage/build/linux-l4h-aarch64/vmlinux.stripped"
+          cp build/linux-l4h-aarch64/sdk.erofs build/linux-l4h-aarch64/.config "$stage/build/linux-l4h-aarch64/"
+          cp build/linux-l4h-aarch64/scripts/basic/fixdep "$stage/build/linux-l4h-aarch64/scripts/basic/"
+          cp build/linux-l4h-aarch64/scripts/mod/modpost "$stage/build/linux-l4h-aarch64/scripts/mod/"
+          tar -cf build/prebuilt-aarch64.tar \
+            -C "$stage" build/linux-l4h-aarch64 \
+            -C "$PWD" \
+            build/sel4-aarch64 \
+            build/kernel-aarch64/kernel.elf \
+            build/loader-target/aarch64-unknown-none/release/sel4-kernel-loader \
+            build/loader-target/release/sel4-kernel-loader-add-payload \
+            build/guest/flags-test build/guest/flagsvm.cpio.gz \
+            build/guest/page-aging/l4h_page_aging.ko \
+            build/guest/pvlock/l4h_pvlock.ko \
+            build/guest/bpf/test_bpf.ko \
+            build/guest/module/l4h_modtest.ko \
+            build/prebuilt/l4h-root-inject.elf \
+            host/target/aarch64-sel4-roottask/debug/l4h-root.elf \
+            tools/l4hctl/target/aarch64-unknown-linux-gnu/release/l4hctl
+          rm -rf "$stage"
+          # Also build the 6 GiB kernel/loader used by run-limits.sh.
+          L4H_MEM=6G tools/build-kernel-aarch64.sh
+          L4H_MEM=6G tools/build-loader-aarch64.sh
+          tar -cf build/prebuilt-aarch64-6g.tar \
+            build/sel4-aarch64 \
+            build/loader-target/aarch64-unknown-none/release/sel4-kernel-loader
+          ls -lh build/prebuilt-aarch64.tar build/prebuilt-aarch64-6g.tar
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: prebuilt-aarch64
+          path: |
+            build/prebuilt-aarch64.tar
+            build/prebuilt-aarch64-6g.tar
+          retention-days: 1
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: logs-build-aarch64
+          path: |
+            build/*.log
+            build/*/*.log
+
+  aarch64-core:
+    name: aarch64 core & devices (QEMU/TCG)
+    needs: build-aarch64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container:
+      image: debian:trixie
+    env:
+      L4H_ARCH: aarch64
+      L4H_PREBUILT: '1'
+      L4H_TEST_TIMEOUT: 600
+    steps:
+      - name: Install git
+        run: apt-get update -q && apt-get install -y -q --no-install-recommends git ca-certificates
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: prebuilt-aarch64
+          path: build
+      - name: Unpack prebuilt stack
+        run: tar -xf build/prebuilt-aarch64.tar && rm -f build/prebuilt-aarch64*.tar
+      - name: Set up
+        run: tools/ci-setup.sh aarch64-run
       - name: Guest ABI and PCI (EL1)
         run: tests/run-abitest.sh
       - name: Boot RAM clearing and initial user context
@@ -382,35 +808,138 @@ jobs:
         run: tests/run-thptest.sh 4
       - name: Kernel modules
         run: tests/run-modtest.sh
-      - name: BPF JIT
-        run: tests/run-bpftest.sh
-      - name: BPF JIT (LSE atomics)
-        run: L4H_QEMU_CPU=max tests/run-bpftest.sh
       - name: Android kernel features
         run: tests/run-androidtest.sh
       - name: Display (virtio-gpu)
         run: tests/run-gputest.sh
       - name: Block pass-through (virtio-blk and NVMe)
         run: tests/run-blktest.sh && BLKTEST_DEV=nvme tests/run-blktest.sh
-      - name: Control API
-        run: tests/run-ctltest.sh
-      - name: Network
-        run: tests/run-nettest.sh
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: logs-aarch64-core
+          path: |
+            build/*.log
+            build/*/*.log
+
+  aarch64-bpf-sched:
+    name: aarch64 BPF, monitor & scheduler (QEMU/TCG)
+    needs: build-aarch64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container:
+      image: debian:trixie
+    env:
+      L4H_ARCH: aarch64
+      L4H_PREBUILT: '1'
+      L4H_TEST_TIMEOUT: 600
+    steps:
+      - name: Install git
+        run: apt-get update -q && apt-get install -y -q --no-install-recommends git ca-certificates
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: prebuilt-aarch64
+          path: build
+      - name: Unpack prebuilt stack
+        run: tar -xf build/prebuilt-aarch64.tar && rm -f build/prebuilt-aarch64*.tar
+      - name: Set up
+        run: tools/ci-setup.sh aarch64-run
+      - name: BPF JIT
+        run: tests/run-bpftest.sh
+      - name: BPF JIT (LSE atomics)
+        run: L4H_QEMU_CPU=max tests/run-bpftest.sh
       - name: Serial monitor
         run: tests/run-monitor.sh
-      - name: l4h-logd and failures
-        run: tests/run-logdtest.sh
       - name: CPU caps, steal time and dom0 restart
         run: tests/run-m6test.sh
       - name: Paravirtual spinlocks
         run: tests/run-pvlocktest.sh
+      - name: l4h-logd and failures
+        run: |
+          cp build/prebuilt/l4h-root-inject.elf host/target/aarch64-sel4-roottask/debug/l4h-root.elf
+          L4H_PREBUILT_INJECT=1 tests/run-logdtest.sh
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: logs-aarch64-bpf-sched
+          path: |
+            build/*.log
+            build/*/*.log
+
+  aarch64-ctl-net:
+    name: aarch64 control API & network (QEMU/TCG)
+    needs: build-aarch64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container:
+      image: debian:trixie
+    env:
+      L4H_ARCH: aarch64
+      L4H_PREBUILT: '1'
+      L4H_TEST_TIMEOUT: 600
+      NETTEST_TIMEOUT: 600
+      CTLTEST_TIMEOUT: 1800
+    steps:
+      - name: Install git
+        run: apt-get update -q && apt-get install -y -q --no-install-recommends git ca-certificates
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: prebuilt-aarch64
+          path: build
+      - name: Unpack prebuilt stack
+        run: tar -xf build/prebuilt-aarch64.tar && rm -f build/prebuilt-aarch64*.tar
+      - name: Set up
+        run: tools/ci-setup.sh aarch64-run
+      - name: Control API
+        run: tests/run-ctltest.sh
+      - name: Network
+        run: tests/run-nettest.sh
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: logs-aarch64-ctl-net
+          path: |
+            build/*.log
+            build/*/*.log
+
+  aarch64-limits:
+    name: aarch64 resource limits (QEMU/TCG)
+    needs: build-aarch64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container:
+      image: debian:trixie
+    env:
+      L4H_ARCH: aarch64
+      L4H_PREBUILT: '1'
+      L4H_TEST_TIMEOUT: 600
+    steps:
+      - name: Install git
+        run: apt-get update -q && apt-get install -y -q --no-install-recommends git ca-certificates
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: prebuilt-aarch64
+          path: build
+      - name: Unpack prebuilt stack (6 GiB kernel/loader)
+        run: |
+          tar -xf build/prebuilt-aarch64.tar
+          tar -xf build/prebuilt-aarch64-6g.tar
+          rm -f build/prebuilt-aarch64*.tar
+      - name: Set up
+        run: tools/ci-setup.sh aarch64-run
       - name: Resource limits
         run: tests/run-limits.sh
       - name: Upload logs
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: logs-aarch64
+          name: logs-aarch64-limits
           path: |
             build/*.log
             build/*/*.log

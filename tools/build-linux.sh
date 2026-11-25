@@ -12,6 +12,18 @@ case "$arch" in
     aarch64) out=$root/build/linux-l4h-aarch64 ;;
     *) echo "unsupported L4H_ARCH: $arch" >&2; exit 1 ;;
 esac
+if [[ ${L4H_PREBUILT:-0} == 1 || ${L4H_PREBUILT:-0} == guest ]] && [ -f "$out/vmlinux" ]; then
+    prebuilt_ok=1
+    for arg in "${@:-vmlinux}"; do
+        case "$arg" in
+            vmlinux|modules) ;;
+            *) prebuilt_ok=0; break ;;
+        esac
+    done
+    if [ "$prebuilt_ok" = 1 ]; then
+        exit 0
+    fi
+fi
 if [ ! -d "$src" ]; then
     echo "missing $src: extract linux-6.18.y there (see DESIGN.md §14)" >&2
     exit 1
