@@ -1237,15 +1237,18 @@ impl Sim {
 
                 let vc = &mut g.vcpus[v];
                 vc.cooldown = vc.cooldown.saturating_sub(1);
+                let mut waited = 0;
                 if vc.wall_us != 0 || c != 0 {
                     vc.wall_us += elapsed_us;
                     vc.run_us += c;
                     let steal_us = vc.wall_us.saturating_sub(vc.run_us).saturating_sub(vc.idle_us);
                     let ns = steal_us * 1000;
                     if ns > vc.steal_ns {
+                        waited = (ns - vc.steal_ns) / 1000;
                         vc.steal_ns = ns;
                     }
                 }
+                let wanted = if g.cpu_cap_pct > 0 { c } else { (c + waited).min(elapsed_us.max(c)) };
 
                 samples.push(policy::Sample {
                     guest: g.id,
@@ -1253,6 +1256,7 @@ impl Sim {
                     vcore: vc.vcore,
                     cpu: vc.core,
                     used: c,
+                    wanted,
                     movable: vc.cooldown == 0,
                 });
             }

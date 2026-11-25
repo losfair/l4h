@@ -456,8 +456,9 @@ pub fn idle_ticks(page: *mut crate::guest::EventPage, now: u64) -> Option<u64> {
 /// last step (ending at counter value `now`), move at most one vCPU or
 /// vCore, then tell each vCPU what capacity other guests leave it.
 ///
-/// A vCPU is *busy* if it used at least half of its fair share of its
-/// logical CPU (among the vCPUs active there). Balance their number per
+/// A vCPU is *busy* if it wanted at least half of its fair share of its
+/// logical CPU (among the vCPUs active there): what it used and what it
+/// waited for the CPU, its steal time. Balance their number per
 /// physical core first, then per logical CPU. SMT siblings share execution
 /// resources even when each has only one busy vCPU.
 pub fn balance(h: &mut Vmmgr, elapsed_us: u64, now: u64) {
@@ -528,6 +529,7 @@ pub fn balance(h: &mut Vmmgr, elapsed_us: u64, now: u64) {
                 vcpu.usage = (c * 1000 / elapsed_us) as u32;
                 // Steal: time the vCPU existed minus what it ran minus what it
                 // spent idle (reported by the guest).
+                let mut waited = 0;
                 if vcpu.wall_ticks != 0 || c != 0 {
                     vcpu.wall_ticks += elapsed_us * tsc_mhz;
                     vcpu.run_ticks += c * tsc_mhz;
@@ -536,6 +538,7 @@ pub fn balance(h: &mut Vmmgr, elapsed_us: u64, now: u64) {
                         // steal * 1000 overflows after weeks of steal: u128.
                         let ns = u64::try_from(steal as u128 * 1000 / tsc_mhz as u128).unwrap_or(u64::MAX);
                         if ns > vcpu.steal_ns {
+                            waited = (ns - vcpu.steal_ns) / 1000;
                             vcpu.steal_ns = ns;
                             unsafe { core::ptr::addr_of_mut!((*page).steal_ns).write_volatile(ns) };
                         }
@@ -543,8 +546,11 @@ pub fn balance(h: &mut Vmmgr, elapsed_us: u64, now: u64) {
                 }
                 // Guests are below MAX_GUESTS and have at most MAX_VCPUS
                 // vCPUs, so the samples fit.
+                // What it waited for a CPU counts as demand (policy.rs,
+                // Census::busy), unless it waited for its own cap's budget.
+                let wanted = if g.cpu_cap_pct > 0 { c } else { c.saturating_add(waited).min(elapsed_us.max(c)) };
                 let _ = sample.push(policy::Sample { guest: g.id, vcpu: v, vcore: vcpu.vcore, cpu: vcpu.core, used: c,
-                    movable: vcpu.cooldown == 0 });
+                    wanted, movable: vcpu.cooldown == 0 });
             }
         }
         let action = if cores < 2 { None } else { policy::choose(&h.info.topology, sample, elapsed_us, &core_vmm) }?;

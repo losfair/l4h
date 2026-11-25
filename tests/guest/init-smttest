@@ -44,7 +44,7 @@ for i in 1 2 3 4 5 6 7 8 9 10; do
     [ "$((ca / 2))" -ne "$((cb / 2))" ] && break
 done
 echo "SMTTEST: busy guests on CPUs $ca and $cb"
-[ "$((ca / 2))" -ne "$((cb / 2))" ] || fail "busy guests still share SMT siblings"
+[ "$((ca / 2))" -ne "$((cb / 2))" ] || fail "busy guests still share SMT siblings: $(l4hctl cpus | tr '\n' ';')"
 # CTL_VM_VCPU_STATS: some core carries each busy guest's load, by name
 # (wherever the balancer has it now).
 cpus=$(l4hctl cpus) || fail "cpus"

@@ -167,7 +167,7 @@ fn vcpus_without_a_vmm_keep_the_existing_two_context_budget() {
 }
 
 fn vcpu(guest: usize, vcpu: usize, cpu: usize, used: u64) -> Sample {
-    Sample { guest, vcpu, vcore: 0, cpu, used, movable: true }
+    Sample { guest, vcpu, vcore: 0, cpu, used, wanted: used, movable: true }
 }
 
 /// Number each guest's vCores by physical core, as placement would.
@@ -292,6 +292,28 @@ fn starved_busy_vcpus_count_and_low_caps_do_not_trigger_migration() {
     assert_eq!(choose(&t, &[], PERIOD, &NO_VMM), None);
 }
 
+/// Two PV guests spinning on one CPU, which seL4 divided 84:16 (measured,
+/// tests/run-smttest.sh): the one with less than half its share waited
+/// for the rest, so both are busy and one moves to the idle core.  The
+/// same use without the wait (a guest that idles) stays, and so does a
+/// capped vCPU, whose `wanted` is its use.
+#[test]
+fn a_vcpu_starved_below_half_its_share_is_busy_by_what_it_waited() {
+    let t = Topology::from_ids(&[0, 0, 1, 1]);
+    let split = |wanted| {
+        let mut s = [vcpu(0, 0, 1, PERIOD * 84 / 100), vcpu(1, 0, 1, PERIOD * 16 / 100), vcpu(2, 0, 3, PERIOD / 1000)];
+        s[1].wanted = wanted;
+        vcores(&t, s.into())
+    };
+    assert_eq!(choose(&t, &split(PERIOD * 16 / 100), PERIOD, &NO_VMM), None);
+    let s = split(PERIOD);
+    assert!(matches!(choose(&t, &s, PERIOD, &NO_VMM), Some(Action::VcoreSwap { ps: 0, pd: 2, .. })));
+    // More than the period, or less than the use (a guest's idle counters
+    // are its own to write): the period, and the use.
+    assert!(choose(&t, &split(u64::MAX), PERIOD, &NO_VMM).is_some());
+    assert_eq!(choose(&t, &split(0), PERIOD, &NO_VMM), None);
+}
+
 #[test]
 fn use_an_available_source_when_the_busiest_cannot_move() {
     let t = Topology::flat(3);
@@ -376,7 +398,7 @@ fn equal_vcores_do_not_ping_pong() {
         policy::place(&t, &load, g, &mut out);
         for (v, &(cpu, vcore)) in out.iter().enumerate() {
             load[cpu] += 1;
-            s.push(Sample { guest: g, vcpu: v, vcore, cpu, used: 0, movable: true });
+            s.push(Sample { guest: g, vcpu: v, vcore, cpu, used: 0, wanted: 0, movable: true });
         }
     }
     let mut moves = 0;
