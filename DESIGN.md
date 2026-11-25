@@ -1318,7 +1318,28 @@ create fails with `-ENODEV`. `l4hctl list` shows them as `hvm`.
   above the thread bits and its place in the vCore below, leaf 4 (and on
   AMD TOPOEXT's 0x8000_001d and 0x8000_001e) shares L1 and L2 within a
   core and L3 across the package; leaves it does not know are zero;
-  MSRs outside a fixed table raise `#GP`. An emulated TSC deadline has at
+  MSRs outside a fixed table raise `#GP`. Of the speculation controls,
+  which seL4's VCPUs do not switch (the guest runs with the host's),
+  the guest reads the host's as FL4's kernel configuration (§10.1) says
+  the boot core had them at boot, and changes none (`x86/msr.rs`,
+  `vm::SpecMsrs`): `IA32_ARCH_CAPABILITIES` (and CPUID 7's bit for it)
+  with only what the hardware is or is immune to, never a control MSR
+  the guest lacks (`TSX_CTRL` and `FB_CLEAR_CTRL`/`GDS_CTRL` only with
+  their MSRs), and `IBRS_ALL` only where the host's `SPEC_CTRL` has IBRS
+  set; `IA32_SPEC_CTRL`, `IA32_TSX_CTRL` and `IA32_MCU_OPT_CTRL` (Intel)
+  and `BP_CFG` (AMD) read only, a write of the value they hold taken
+  (Linux writes back what it read), any other `#GP`; AMD's `DE_CFG` with
+  the host's bits, which stay set, and the LFENCE-serializing bit, which
+  the guest may add. A Linux guest that sees `IBRS_ALL` takes enhanced
+  IBRS, which the host's `SPEC_CTRL` (FL4 sets IBRS there with it) gives
+  it, and writes IBRS alone to `SPEC_CTRL` on each vCPU, which is taken
+  too, where the host has IBRS; without `IBRS_ALL` it uses retpolines
+  and never writes it. CPUID still enumerates none of the speculation
+  controls, and `PRED_CMD` stays hidden. On seL4, which does not say,
+  there are none of these MSRs, as before. AMD's CPUID `0x8000_0021`
+  gives the hardware's immunities with LFENCE serializing and Automatic
+  IBRS (no nested data breakpoints, null selectors clearing the base,
+  `SRSO_NO`, `SRSO_USER_KERNEL_NO`), and `0x8000_0008` its `BTC_NO`. An emulated TSC deadline has at
   least 1 ms of lead time from the WRMSR handler, so the guest can run
   between timer interrupts. The MSR reads back the requested value until
   the timer expires. Linux reads leaf 0x15 only on Intel. On AMD it
@@ -1472,6 +1493,21 @@ create fails with `-ENODEV`. `l4hctl list` shows them as `hvm`.
   - *Seals.* `CONSOLE_IN` and `CONSOLE_OUT` gate dom0's console
     operations on an HVM guest as on any (they are vmmgr's, by guest
     instance).
+- **Kernel configuration.** Every HVM guest, on both architectures, has
+  a second virtio-console (PCI `00:1e.0`, `hvm::KCONFIG_SLOT`; devices
+  take slots 1 to 29) with one port, named `l4h.kconfig` (`abi.h`,
+  `L4H_KCONFIG_PORT_*`), through which its userspace reads the host
+  kernel's configuration (§10.1) one key at a time. l4h-hvm serves it
+  (`dev/kconfig.rs`) from `l4h_rt::kconfig`, which asks the kernel
+  (`seL4_KernelConfig`, no capability, no exit): a 16-byte request
+  (magic, reserved 0, key) and a 24-byte answer (magic, status, value),
+  each answered in the I/O thread's turn that reads it. A key the kernel
+  does not know is `-ENOENT`, and every key on seL4 `-ENOSYS`; a header
+  that is none (another magic, reserved set) is answered `-EINVAL`, and
+  nothing is read after it until the port is opened again. Opening and
+  closing the port, its bounded turns and what it throws away are the
+  attestation port's. `l4hctl kernel` uses it where there is no
+  `/dev/l4h-kconfig`.
 - **Tests.** `tests/run-hvmunit.sh` tests the device models, the decoder,
   the page walker, boot and ACPI against a model of guest RAM, and the
   vCPU and I/O threads' code together under a scripted guest, with
@@ -4522,6 +4558,25 @@ machine each dom0 sees its root's inventory. `l4hctl pci` prints the list;
 `l4hctl pci --json` supplies numeric IDs and class fields for boot-time
 platform selection.
 
+**Kernel configuration.** What the host's microkernel found and chose at
+boot is FL4's `seL4_KernelConfig(key)`: one word per key
+(`seL4_KernelConfig_*` in FL4's `sel4/constants.h`: cores, the
+virtualization backend or why there is none, a confidential VM, the
+mitigations with the boot core's speculation-control MSRs, CPU and
+platform features), the same in every guest and never changing after
+boot. It needs no capability, so no host service is asked: an l4h guest's
+kernel asks through its ABI provider (`l4h_kernel_config`, with the
+`L4H_PROVIDER_KERNEL_CONFIG` feature; the provider built against seL4's
+libsel4, which has no such call, has no feature and answers `-ENOSYS`) and
+gives it to anyone in the guest, dom0 or not, as `/dev/l4h-kconfig` (mode
+0444, ioctl `L4H_KCONFIG_IOC` with the key and its value; `-ENOENT` for a
+key the kernel does not know, or of the other architecture); an HVM guest
+reads it through its kernel configuration port (§5.11). `l4hctl kernel
+[--json] [--key KEY]` prints every key the kernel has, decoded and by
+group (or one, by its libsel4 name or number), through either, and
+`l4hctl info` adds a `virt:` and a `spec:` line from it where the kernel
+says (none on seL4).
+
 A Rust userspace library and CLI live in `tools/l4hctl`; external
 orchestration runs in dom0. Devices are attached before start and removed
 on
@@ -6596,7 +6651,7 @@ machine and guests of 256–512 MiB.
 | `tests/run-blktest.sh` (`BLKTEST_DEV=nvme`, `scsi`, `scsi-legacy`, `scsi-luns`, `virtio-legacy`, `ahci`, `ahci-disks`) | disk windows and data integrity; AHCI adds static ATA ports behind an ATAPI device, parallel I/O and independent disks |
 | `tests/run-sharedblk.sh` | shared controllers: concurrent clients, windows, provisioning, destroy during I/O |
 | `tests/run-lvmblk.sh` | LVM linear volumes as extent disks: dm-linear agreement, split requests, overlap and provisioning refusal (needs `lvm2` on the build host) |
-| `tests/run-hvmunit.sh` | HVM guests' device models without seL4: decoder (illegal encodings included), page walker, bzImage/ELF loading, zero page and E820, ACPI checksums, ECAM, virtio-pci and MSI-X, the attestation port (its control messages, requests and answers in pieces, what is no request, closing it, trustd failing), local APIC/x2APIC/I/O APIC, UART, RTC, PIT, CPUID, I/O pool bounce and backpressure, hostile queue addresses; and the whole machine (vCPU and I/O thread code, blkd and netd modelled) under a scripted guest: boot state, CPUID/MSRs, PCI enumeration, virtio-blk and virtio-net with MSI-X, INIT/SIPI, the UART both ways, the ACPI power button and S5; on AArch64 (GICv3 and GICv2) the GIC, PSCI, system registers, PL011, PL031, PL061, the device tree and Image/ELF loading, and the whole machine likewise |
+| `tests/run-hvmunit.sh` | HVM guests' device models without seL4: decoder (illegal encodings included), page walker, bzImage/ELF loading, zero page and E820, ACPI checksums, ECAM, virtio-pci and MSI-X, the attestation port (its control messages, requests and answers in pieces, what is no request, closing it, trustd failing), the kernel configuration port (its answers, requests in pieces, what is no request, closing it), the host's speculation-control MSRs (`IA32_ARCH_CAPABILITIES` sanitized and `IBRS_ALL` with the host's IBRS, read-only `SPEC_CTRL` and the other controls, AMD's DE_CFG), local APIC/x2APIC/I/O APIC, UART, RTC, PIT, CPUID, I/O pool bounce and backpressure, hostile queue addresses; and the whole machine (vCPU and I/O thread code, blkd and netd modelled) under a scripted guest: boot state, CPUID/MSRs, PCI enumeration, virtio-blk and virtio-net with MSI-X, INIT/SIPI, the UART both ways, the ACPI power button and S5; on AArch64 (GICv3 and GICv2) the GIC, PSCI, system registers, PL011, PL031, PL061, the device tree and Image/ELF loading, and the whole machine likewise |
 | `tests/run-hvmtest.sh` | an unmodified x86-64 Linux as an HVM guest (§5.11): SMP, virtio-blk write and read back, virtio-net, console output and input, ACPI shutdown, destroy while running, memory reclaim, and under `lockdown=confidentiality` the host's flags through the attestation port and the console seal dom0 cannot pass; needs nested VT-x or AMD-V under KVM (QEMU's TCG SVM lacks the next-RIP saving seL4 requires), and otherwise checks that HVM guests are refused (`-ENODEV`) and skips |
 | `tests/run-hvmtest-arm64.sh` | the same on AArch64: an unmodified arm64 Linux on FL4 at EL2 under QEMU's TCG, with GICv3 or GICv2 (`L4H_QEMU_GIC_VERSION`), shutdown by the PL061 power button and PSCI; at EL1 (`L4H_QEMU_VIRTUALIZATION=off`), that HVM guests are refused (`-ENODEV`) |
 | `tests/run-ctltest.sh` | VM lifecycle, console, clean shutdown, disk re-attach, windows, reclaim |

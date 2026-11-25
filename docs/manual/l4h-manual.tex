@@ -1230,6 +1230,22 @@ the monitor is disabled and the serial log explains why. If the
 hardware cannot remap interrupts, DMA confinement still works and
 \texttt{interrupts} reports that remapping is unavailable.
 
+\cmd{l4hctl kernel} prints what the host's kernel found and chose at
+boot, by group: cores, the virtualization backend (or why there is none),
+a confidential VM, the mitigations with the boot core's
+speculation-control MSRs decoded, and CPU and platform features. It
+works in any guest, dom0 or not, HVM guests included (through their
+\texttt{l4h.kconfig} port), and needs FL4: on seL4 it says the kernel does
+not tell. \cmd{--json} gives each key's number, name, value (and in
+\texttt{hex}, for MSRs past $2^{53}$) and decoded names;
+\cmd{--key KEY} one key, by its libsel4 name (\texttt{VirtBackend},
+\texttt{X86ArchCapabilities}) or number (\texttt{0x0100}). On FL4,
+\cmd{l4hctl info} adds two lines from it:
+\begin{lstlisting}
+virt:   vt-x
+spec:   complete, safe-ret,eibrs,verw-buffers
+\end{lstlisting}
+
 With Intel VT-d, devices behind a conventional PCI bridge can share one
 requester ID. Root reports the shared requester in the serial log and
 places those devices in one DMA domain. They can access the group's DMA
