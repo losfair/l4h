@@ -300,8 +300,8 @@ impl<H: Hw> Vcpu<H> {
                 self.signals_seen = signals;
                 crate::sys::poll(self.id);
             }
-            let waited = w.asked.load(Ordering::Relaxed).wrapping_sub(start);
-            self.poll_window = halt_poll_window(self.poll_window, waited.min(self.poll_window), vm().tsc_hz / 1_000_000 * HALT_POLL_US);
+            // Polling caught it: the window grows.
+            self.poll_window = halt_poll_window(self.poll_window, 0, vm().tsc_hz / 1_000_000 * HALT_POLL_US);
             return;
         }
         // Idle: the time blocked.  A poll ran on the vCPU's budget, as its
@@ -357,7 +357,11 @@ impl<H: Hw> Vcpu<H> {
         loop {
             let now = vm::now();
             if woken(now) {
+                // As after the timeout: what the caller reads of the
+                // request next comes after the store (turn's own SeqCst
+                // swap of the flags does that today, but need not).
                 w.polling.store(false, Ordering::Relaxed);
+                core::sync::atomic::fence(Ordering::SeqCst);
                 return true;
             }
             if now.wrapping_sub(start) >= ticks {
@@ -1376,7 +1380,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn halt_poll_window_adapts_as_the_pv_idle_loop() {
+    fn halt_poll_window_grows_and_halves() {
         let max = 100_000;
         // Starts off: the first halt blocks, and a short one opens it at
         // an eighth, doubling up to the maximum.

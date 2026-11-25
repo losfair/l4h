@@ -28,7 +28,8 @@ ok=1
 # HVMEXIT=1: the VM exit round trip (CPUID) on CPUs 0, 1, the middle
 # and the last, then cross-CPU ping-pong alone.
 if [ -n "$HVMEXIT" ]; then
-    /bin/exitlat 0 1 $((n / 2)) $((n - 1)) 2>&1 | sed 's/^/HVMSCALE: /'
+    /bin/exitlat 0 1 $((n / 2)) $((n - 1)) > /tmp/out 2>&1 || ok=
+    sed 's/^/HVMSCALE: /' /tmp/out
     /bin/smpbench 2 > /tmp/out 2>&1 || ok=
     grep -E 'phase=measured metric=(pipe|futex)' /tmp/out | sed 's/^/HVMSCALE: /'
     if [ -n "$ok" ]; then echo 'HVMSCALE: guest PASS'; else echo 'HVMSCALE: guest FAIL exitlat'; fi
