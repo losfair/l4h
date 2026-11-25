@@ -34,6 +34,10 @@ pub struct Sample {
     pub vcore: usize,
     pub cpu: usize,
     pub used: u64,
+    /// `used` plus what it waited for its CPU over the period (its steal
+    /// time: neither running nor idle), at most the period; `used` for a
+    /// capped vCPU, which waits for its own budget.
+    pub wanted: u64,
     pub movable: bool,
 }
 
@@ -315,10 +319,17 @@ impl Census {
 
     /// Half a fair share still recognizes a starved vCPU on a crowded CPU:
     /// a share of what the CPU's VMMs left (a monitor that takes 76% of it
-    /// leaves a vCPU using the other 24% busy).
+    /// leaves a vCPU using the other 24% busy).  The share is of what the
+    /// vCPU wanted, not only of what it got: seL4 does not divide a CPU
+    /// evenly between threads of one priority that are preempted and
+    /// resumed at different rates (of two PV guests spinning in user mode
+    /// on one CPU, one got 84% and the other 16%, for as long as they
+    /// shared it), and the one left with less than half its share is the
+    /// one that most needs another CPU.
     fn busy(&self, s: &Sample) -> bool {
         let left = self.elapsed_us.saturating_sub(self.vmm[s.cpu]);
-        s.used * 100 >= self.elapsed_us * ACTIVE_PCT && s.used * self.active[s.cpu] * 2 >= left
+        let wanted = s.wanted.clamp(s.used, self.elapsed_us.max(s.used));
+        s.used * 100 >= self.elapsed_us * ACTIVE_PCT && wanted * self.active[s.cpu] * 2 >= left
     }
 }
 

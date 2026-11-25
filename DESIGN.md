@@ -1812,9 +1812,16 @@ seL4 does no load balancing, so `l4h-vmmgr` runs a balancer every 100 ms.
 - **Balancing.** Each period vmmgr reads `SchedContext_Consumed` for both
   SCs of every vCPU, over the measured interval (root work can delay a
   period).
-  - A vCPU is *busy* if it got at least half of its fair share among the
-    vCPUs active on its core, which still counts a starved vCPU on a
-    crowded core.
+  - A vCPU is *busy* if it wanted at least half of its fair share among
+    the vCPUs active on its core, which still counts a starved vCPU on a
+    crowded core. What it wanted is what it used plus what it waited for
+    the CPU over the period, its steal time (§7.4); a capped vCPU's is its
+    use alone, since it waits for its own budget. The wait matters because
+    seL4 does not divide a CPU evenly between threads of one priority
+    that are preempted and resumed at different rates: of two PV guests
+    spinning in user mode on one CPU, one got 84% and the other 16% for as
+    long as they shared it (`tests/run-smttest.sh`), and by use alone the
+    second was not busy, so neither moved to the idle core beside them.
   - The balancer evens out busy-vCPU counts per physical core first, then
     per logical CPU, with one action per period that reduces the sum of
     squared counts at the first level that improves: a *vCore swap* moves a
