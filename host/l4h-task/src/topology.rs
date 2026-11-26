@@ -3,7 +3,7 @@
 
 /// CPUs a topology can describe: at least seL4's KernelMaxNumNodes in
 /// either configuration (sched.rs checks it).
-pub const MAX_CPUS: usize = 64;
+pub const MAX_CPUS: usize = 128;
 
 pub struct Topology {
     cpus: usize,

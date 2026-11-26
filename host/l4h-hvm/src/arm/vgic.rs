@@ -100,8 +100,12 @@ fn bit(intid: u32) -> u32 {
     1 << (intid % 32)
 }
 
+/// A set of vCPUs, a bit each.
+type Vcpus = u128;
+const _: () = assert!(MAX_VCPUS <= Vcpus::BITS as usize);
+
 /// The vCPUs of mask `m`, in turn.
-fn each(mut m: u64) -> impl Iterator<Item = usize> {
+fn each(mut m: Vcpus) -> impl Iterator<Item = usize> {
     core::iter::from_fn(move || {
         (m != 0).then(|| {
             let t = m.trailing_zeros() as usize;
@@ -281,8 +285,8 @@ impl Vgic {
     }
 
     /// Every vCPU, a bit each.
-    fn all(&self) -> u64 {
-        if self.vcpus >= 64 { u64::MAX } else { (1 << self.vcpus) - 1 }
+    fn all(&self) -> Vcpus {
+        if self.vcpus >= Vcpus::BITS as usize { Vcpus::MAX } else { (1 << self.vcpus) - 1 }
     }
 
     /// Bring what the I/O thread raised into the latches.
@@ -332,10 +336,10 @@ impl Vgic {
     /// Run `f` under the lock with the vCPUs of `mask` (but `me`, which is
     /// outside its guest) out of their guests, their list registers as
     /// they left them, and kept out until `f` is done.  It adds to its
-    /// `&mut u64` the vCPUs that are then to look.  Those waiting here wait
+    /// `&mut Vcpus` the vCPUs that are then to look.  Those waiting here wait
     /// only for vCPUs in their guests, which leave when told to, never for
     /// each other: no cycle of waits can form.  Never the I/O thread's.
-    fn with_paused<R>(&self, me: usize, mask: u64, wake: &mut impl FnMut(usize), f: impl FnOnce(&mut State, &mut u64) -> R) -> R {
+    fn with_paused<R>(&self, me: usize, mask: Vcpus, wake: &mut impl FnMut(usize), f: impl FnOnce(&mut State, &mut Vcpus) -> R) -> R {
         let mask = mask & !(1 << me);
         if mask != 0 {
             let mut running = 0;
@@ -372,7 +376,7 @@ impl Vgic {
 
     /// Who to keep out of their guests for an access by `me` to the pending
     /// or active state of word `w` of `cpu`'s view.
-    fn pause_for(&self, me: usize, cpu: usize, w: usize) -> u64 {
+    fn pause_for(&self, me: usize, cpu: usize, w: usize) -> Vcpus {
         if w == 0 {
             if cpu == me { 0 } else { 1 << cpu }
         } else {
@@ -381,7 +385,7 @@ impl Vgic {
     }
 
     /// `pause_for` the distributor's register at `off`, if it is such a one.
-    fn dist_pause(&self, me: usize, off: u64) -> u64 {
+    fn dist_pause(&self, me: usize, off: u64) -> Vcpus {
         let o = off & !3;
         let base = match o {
             _ if (GICD_ISPENDR..GICD_ICPENDR).contains(&o) => GICD_ISPENDR,
@@ -395,7 +399,7 @@ impl Vgic {
     }
 
     /// `pause_for` register `off` of `cpu`'s redistributor.
-    fn redist_pause(&self, me: usize, cpu: usize, off: u64) -> u64 {
+    fn redist_pause(&self, me: usize, cpu: usize, off: u64) -> Vcpus {
         let o = off & !3;
         if [GICD_ISPENDR, GICD_ICPENDR, GICD_ISACTIVER, GICD_ICACTIVER].iter().any(|&r| o == GICR_SGI + r) {
             self.pause_for(me, cpu, 0)
@@ -470,7 +474,7 @@ impl Vgic {
     }
 
     /// SGI `sgi` from vCPU `me` to the vCPUs of `targets`, which are told.
-    fn send_sgis(&self, me: usize, targets: u64, sgi: usize, wake: &mut impl FnMut(usize)) {
+    fn send_sgis(&self, me: usize, targets: Vcpus, sgi: usize, wake: &mut impl FnMut(usize)) {
         if self.v3 {
             return self.with_paused(me, 0, wake, |st, then| {
                 for t in each(targets) {
@@ -502,7 +506,7 @@ impl Vgic {
 
     /// The other vCPUs of `targets` with an SGI from `src` in a list
     /// register that, as last known, the guest has not acknowledged.
-    fn sgi_held(&self, st: &State, me: usize, targets: u64, sgi: usize, src: u8) -> u64 {
+    fn sgi_held(&self, st: &State, me: usize, targets: Vcpus, sgi: usize, src: u8) -> Vcpus {
         each(targets)
             .filter(|&t| t != me && st.local[t].held_src[sgi] & src != 0 && st.local[t].word.lr_pending & (1 << sgi) != 0)
             .fold(0, |m, t| m | 1 << t)
@@ -533,7 +537,7 @@ impl Vgic {
         let targets = (0..16u64)
             .filter(|t| v & (1 << t) != 0)
             .filter_map(|t| arm::vcpu_of_aff((aff1 << 8) | t, self.vcpus))
-            .fold(0u64, |m, to| m | 1 << to);
+            .fold(0 as Vcpus, |m, to| m | 1 << to);
         self.send_sgis(me, targets, sgi, wake);
     }
 
@@ -545,8 +549,8 @@ impl Vgic {
             2 => 1 << me,
             _ => 0,
         };
-        let cpus = (1u64 << self.vcpus.min(8)) - 1;
-        self.send_sgis(me, list as u64 & cpus, (v & 0xf) as usize, wake);
+        let cpus: Vcpus = (1 << self.vcpus.min(8)) - 1;
+        self.send_sgis(me, list as Vcpus & cpus, (v & 0xf) as usize, wake);
     }
 
     // ---- What the set and clear registers do, for a word of `cpu`'s view.
@@ -560,7 +564,7 @@ impl Vgic {
     }
 
     /// Whoever holds the interrupts of `bits` in word `w` is to look.
-    fn tell_holders(&self, cpu: usize, w: usize, mut bits: u32, then: &mut u64) {
+    fn tell_holders(&self, cpu: usize, w: usize, mut bits: u32, then: &mut Vcpus) {
         while bits != 0 {
             let i = bits.trailing_zeros();
             bits &= bits - 1;
@@ -571,7 +575,7 @@ impl Vgic {
     }
 
     /// Who is to look after `bits` of word `w` became deliverable.
-    fn tell_targets(&self, me: usize, w: usize, bits: u32, then: &mut u64) {
+    fn tell_targets(&self, me: usize, w: usize, bits: u32, then: &mut Vcpus) {
         if w == 0 {
             *then |= 1 << me;
             return;
@@ -583,13 +587,13 @@ impl Vgic {
         }
     }
 
-    fn set_enable(&self, st: &mut State, cpu: usize, w: usize, bits: u32, then: &mut u64) {
+    fn set_enable(&self, st: &mut State, cpu: usize, w: usize, bits: u32, then: &mut Vcpus) {
         st.word_mut(cpu, w).enable |= bits;
         self.tell_targets(cpu, w, bits, then);
     }
 
     /// A list register's pending interrupt that was disabled goes back.
-    fn clear_enable(&self, st: &mut State, cpu: usize, w: usize, bits: u32, then: &mut u64) {
+    fn clear_enable(&self, st: &mut State, cpu: usize, w: usize, bits: u32, then: &mut Vcpus) {
         let word = st.word_mut(cpu, w);
         word.enable &= !bits;
         let held = word.lr_pending & bits;
@@ -599,7 +603,7 @@ impl Vgic {
     /// GICD_ISPENDR.  A level-sensitive interrupt a list register has
     /// pending stays that one delivery, now pending by software too;
     /// otherwise, one more (after its EOI if the guest has it active).
-    fn set_pending(&self, st: &mut State, cpu: usize, w: usize, bits: u32, then: &mut u64) {
+    fn set_pending(&self, st: &mut State, cpu: usize, w: usize, bits: u32, then: &mut Vcpus) {
         let bits = self.pend_mask(w, bits);
         let word = st.word_mut(cpu, w);
         let in_lr = bits & !word.edge & word.lr_pending;
@@ -610,7 +614,7 @@ impl Vgic {
 
     /// GICD_ICPENDR.  Only what has arrived so far (`with_paused` drained
     /// it): an edge after this is a new one.
-    fn clear_pending(&self, st: &mut State, cpu: usize, w: usize, bits: u32, then: &mut u64) {
+    fn clear_pending(&self, st: &mut State, cpu: usize, w: usize, bits: u32, then: &mut Vcpus) {
         let bits = self.pend_mask(w, bits);
         let word = st.word_mut(cpu, w);
         word.latch &= !bits;
@@ -624,7 +628,7 @@ impl Vgic {
     /// Software activation.  An interrupt the guest has active already
     /// stays as it is, to end with its EOI.  What a list register has not
     /// delivered yet comes back from it.
-    fn set_active(&self, st: &mut State, cpu: usize, w: usize, bits: u32, then: &mut u64) {
+    fn set_active(&self, st: &mut State, cpu: usize, w: usize, bits: u32, then: &mut Vcpus) {
         let word = st.word_mut(cpu, w);
         let new = bits & !word.lr_active;
         word.active |= new;
@@ -632,7 +636,7 @@ impl Vgic {
         self.tell_holders(cpu, w, held, then);
     }
 
-    fn clear_active(&self, st: &mut State, cpu: usize, w: usize, bits: u32, then: &mut u64) {
+    fn clear_active(&self, st: &mut State, cpu: usize, w: usize, bits: u32, then: &mut Vcpus) {
         let word = st.word_mut(cpu, w);
         word.active &= !bits;
         let held = word.lr_active & bits;
@@ -644,7 +648,7 @@ impl Vgic {
     }
 
     /// SPI `id`'s route changed: the vCPU that holds it gives it up.
-    fn rerouted(&self, id: usize, then: &mut u64) {
+    fn rerouted(&self, id: usize, then: &mut Vcpus) {
         let new = self.spi_target(id as u32);
         let owner = self.spi_owner[id].load(SeqCst);
         if owner != NO_OWNER && Some(owner as usize) != new {
@@ -789,7 +793,7 @@ impl Vgic {
         self.with_paused(me, pause, wake, |st, then| self.dist_write_locked(st, me, off, size, v, then));
     }
 
-    fn dist_write_locked(&self, st: &mut State, me: usize, off: u64, size: u8, v: u64, then: &mut u64) {
+    fn dist_write_locked(&self, st: &mut State, me: usize, off: u64, size: u8, v: u64, then: &mut Vcpus) {
         let val = v as u32;
         let word = |base: u64| ((off - base) / 4) as usize;
         match off & !3 {
@@ -954,7 +958,7 @@ impl Vgic {
         self.with_paused(me, self.redist_pause(me, cpu, off), wake, |st, then| self.redist_write_locked(st, cpu, off, size, v, then));
     }
 
-    fn redist_write_locked(&self, st: &mut State, cpu: usize, off: u64, size: u8, v: u64, then: &mut u64) {
+    fn redist_write_locked(&self, st: &mut State, cpu: usize, off: u64, size: u8, v: u64, then: &mut Vcpus) {
         let val = v as u32;
         match off & !3 {
             GICR_WAKER => {

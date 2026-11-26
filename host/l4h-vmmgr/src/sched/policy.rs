@@ -12,8 +12,9 @@ use super::topology::{MAX_CPUS, Topology};
 /// Guests a sample may name (`Sample::guest` is below it); sched.rs checks
 /// it against the host's limit.
 pub const MAX_GUESTS: usize = 64;
-// A guest's CPUs, its vCPUs and the guests are bitmasks of one word each.
-const _: () = assert!(MAX_CPUS <= 64);
+// A guest's CPUs and its vCPUs are bitmasks of a u128 each, the guests
+// one of a u64.
+const _: () = assert!(MAX_CPUS <= 128 && MAX_GUESTS <= 64);
 
 const ACTIVE_PCT: u64 = 2;
 const LIGHT_PCT: u64 = 50;
@@ -129,7 +130,7 @@ pub fn choose(topology: &Topology, sample: &[Sample], elapsed_us: u64, vmm_load:
             physical_busy[p] += 1;
         }
     }
-    let mut guest_cpu = [0u64; MAX_GUESTS];
+    let mut guest_cpu = [0u128; MAX_GUESTS];
     let mut guests = 0u64;
     for s in sample {
         let p = topology.core(s.cpu);
@@ -267,7 +268,7 @@ pub fn swap_moves(topology: &Topology, sample: &[Sample], elapsed_us: u64, vmm_l
         busy[s.cpu] += u64::from(census.busy(s));
     }
     for (from, to) in [(ps, pd), (pd, ps)] {
-        let mut moved = 0u64;
+        let mut moved = 0u128;
         loop {
             let mut next: Option<&Sample> = None;
             for s in sample.iter().filter(|s| s.guest == guest && topology.core(s.cpu) == from && moved & 1 << s.vcpu == 0) {

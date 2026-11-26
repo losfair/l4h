@@ -16,7 +16,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define MAX_CPUS 64
+#define MAX_CPUS 256
 
 struct slot {
 	uint64_t calls, ns;

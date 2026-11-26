@@ -19,7 +19,7 @@
 # with dom0 on every host CPU as for --scale.
 # --hvm measures many-core HVM scaling instead: dom0 (2 vCPUs, VCPUS=n)
 # runs one HVM guest, an unmodified Linux (tools/build-linux-hvm.sh), with
-# HVM_VCPUS vCPUs (default the machine's, at most 64) and HVM_MEM MiB
+# HVM_VCPUS vCPUs (default the machine's, at most 64; 128 on AArch64) and HVM_MEM MiB
 # (default 8192), and that guest runs getpidscale and smpbench at 1, 2,
 # 4, ... and all its CPUs (tests/guest/init-hvmscale, init-hvmscalevm).
 # HVM_ARGS="a b" adds to the guest's kernel command line: HVMFORK=1 runs
@@ -31,7 +31,9 @@
 # HVM guests: SMP, disk, network, console, power button, destroy), on an
 # instance without a vTPM, as that test expects.
 # --aarch64 benchmarks L4H on FL4 for AArch64 on an Arm C4A (default
-# c4a-standard-4 in us-central1-b), dom0 in FL4's UEFI application.
+# c4a-standard-4 in us-central1-b), dom0 in FL4's UEFI application.  With
+# --hvm it needs a bare-metal one, c4a-highmem-96-metal (FL4 at EL2): C4A
+# has 24 vCPUs of quota per region but us-central1's 150.
 # Usage: gce-bench.sh [--sev-snp|--aarch64] [--scale|--probe|--hvm|--hvmtest] PROJECT [ZONE] [MACHINE_TYPE]
 # e.g.   gce-bench.sh PROJECT us-central1-a n4-standard-4
 set -euo pipefail
@@ -87,8 +89,10 @@ if [ -n "$arm" ]; then
     export L4H_ARCH=aarch64 SEL4_PREFIX=$root/build/sel4-fl4-aarch64
 fi
 if [ -n "$hvm" ]; then
-    [ -z "$arm$snp" ] || { echo "gce-bench.sh: --hvm is for x86-64 without --sev-snp" >&2; exit 2; }
-    gce_args+=(--enable-nested-virtualization)
+    [ -z "$snp" ] || { echo "gce-bench.sh: --hvm and --sev-snp cannot be combined" >&2; exit 2; }
+    # x86-64 runs FL4 under nested VT-x/AMD-V; AArch64 needs FL4 at EL2,
+    # which only a bare-metal C4A gives (c4a-highmem-96-metal).
+    [ -n "$arm" ] || gce_args+=(--enable-nested-virtualization)
 fi
 if [ -n "$snp" ]; then
     machine=${3:-n2d-standard-4}
@@ -96,6 +100,11 @@ if [ -n "$snp" ]; then
     gce_args+=(--confidential-compute-type=SEV_SNP --min-cpu-platform="AMD Milan"
         --maintenance-policy=TERMINATE)
 fi
+nic=GVNIC
+case $machine in
+    # Bare metal: an IDPF NIC (no gVNIC), and no live migration.
+    *-metal) nic=IDPF features=UEFI_COMPATIBLE,IDPF gce_args+=(--maintenance-policy=TERMINATE) ;;
+esac
 region=${zone%-*}
 bucket=gs://$project-l4h-test
 out=$root/build/gce-bench
@@ -169,20 +178,35 @@ if [ -n "$hvmtest" ]; then
 elif [ -n "$hvm" ]; then
     build_step l4hctl-build "$root/tools/build-l4hctl.sh"
     build_step linux-hvm-build "$root/tools/build-linux-hvm.sh"
-    cp "$root/build/linux-hvm/arch/x86/boot/bzImage" "$work/bzImage"
-    "$cc" -O2 -static -Wall -Wextra -Werror -o "$work/getpidscale" "$root/tests/guest/getpidscale.c"
-    "$cc" -O2 -static -Wall -Wextra -Werror -o "$work/smpbench" "$root/tests/guest/smpbench.c"
-    "$cc" -O2 -static -Wall -Wextra -Werror -o "$work/forkscale" "$root/tests/guest/forkscale.c"
-    "$cc" -O2 -static -Wall -Wextra -Werror -o "$work/exitlat" "$root/tests/guest/exitlat.c"
+    ctl=$root/tools/l4hctl/target/release/l4hctl
+    [ -n "$arm" ] && ctl=$root/tools/l4hctl/target/aarch64-unknown-linux-gnu/release/l4hctl
+    vmbins=()
+    for b in getpidscale smpbench forkscale; do
+        "$cc" -O2 -static -Wall -Wextra -Werror -o "$work/$b" "$root/tests/guest/$b.c"
+        vmbins+=("$work/$b")
+    done
+    if [ -n "$arm" ]; then
+        # init-hvmscale boots /bin/Image on ttyAMA0 when it has one.
+        kimage=$work/Image
+        cp "$root/build/linux-hvm-aarch64/arch/arm64/boot/Image" "$kimage"
+    else
+        kimage=$work/bzImage
+        cp "$root/build/linux-hvm/arch/x86/boot/bzImage" "$kimage"
+        # exitlat's round trip is CPUID's.
+        "$cc" -O2 -static -Wall -Wextra -Werror -o "$work/exitlat" "$root/tests/guest/exitlat.c"
+        vmbins+=("$work/exitlat")
+    fi
     "$root/tools/mkinitramfs.sh" "$work/hvmscalevm.cpio.gz" "$root/tests/guest/init-hvmscalevm" \
-        "$work/getpidscale" "$work/smpbench" "$work/forkscale" "$work/exitlat" >/dev/null
+        "${vmbins[@]}" >/dev/null
     "$root/tools/mkinitramfs.sh" "$work/dom0.cpio.gz" "$root/tests/guest/init-hvmscale" \
-        "$root/tools/l4hctl/target/release/l4hctl" "$work/bzImage" "$work/hvmscalevm.cpio.gz" >/dev/null
+        "$ctl" "$kimage" "$work/hvmscalevm.cpio.gz" >/dev/null
     marker=HVMSCALE
     vcpus=${VCPUS:-2}
     hvm_vcpus=${HVM_VCPUS:-$(gcloud compute machine-types describe "$machine" --project="$project" \
         --zone="$zone" --format='value(guestCpus)')}
-    [ "$hvm_vcpus" -le 64 ] || hvm_vcpus=64
+    max_vcpus=64
+    [ -n "$arm" ] && max_vcpus=128
+    [ "$hvm_vcpus" -le "$max_vcpus" ] || hvm_vcpus=$max_vcpus
     cmdline+=" HVM_VCPUS=$hvm_vcpus HVM_MEM=${HVM_MEM:-8192}"
     [ -n "${HVM_ARGS:-}" ] && cmdline+=" HVM_ARGS=$(echo "$HVM_ARGS" | tr ' ' ,)"
     mem_mb=1024
@@ -249,7 +273,7 @@ gcloud compute images create "$name" --project="$project" \
     --source-uri="$bucket/$name.tar.gz" --guest-os-features="$features" "${image_arch[@]}" --quiet
 gcloud compute instances create "$name" --project="$project" --zone="$zone" \
     "${gce_args[@]}" --machine-type="$machine" --image="$name" "${iface[@]}" \
-    --network-interface=nic-type=GVNIC --no-service-account --no-scopes \
+    --network-interface=nic-type=$nic --no-service-account --no-scopes \
     --metadata=serial-port-enable=TRUE --no-shielded-secure-boot --quiet
 
 # ---- results from the serial port

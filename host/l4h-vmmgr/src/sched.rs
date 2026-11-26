@@ -119,10 +119,10 @@ fn configure_vmm_sc(info: &HostInfo, g: &mut Guest, core: usize, old: budget::Pl
 }
 
 /// The CPUs where an HVM guest's vCPUs run, or are about to (`arrival`).
-fn hvm_cpus(h: &Vmmgr, arrival: Option<Arrival>) -> u64 {
-    let mut cpus = 0u64;
+fn hvm_cpus(h: &Vmmgr, arrival: Option<Arrival>) -> u128 {
+    let mut cpus = 0u128;
     for g in h.guests.iter().flatten().filter(|g| g.hvm.is_some() && g.state == State::Running) {
-        for v in &g.vcpus { cpus |= 1u64 << v.core; }
+        for v in &g.vcpus { cpus |= 1u128 << v.core; }
     }
     if let Some(a) = arrival.filter(|a| h.guest(a.guest).is_some_and(|g| g.hvm.is_some() && g.state != State::Stopped)) {
         cpus |= a.cores;
@@ -168,7 +168,7 @@ fn kernel_divisors(h: &Vmmgr, arrival: Option<Arrival>) -> [u16; topology::MAX_C
     }
     let mut div = [0u16; topology::MAX_CPUS];
     for c in 0..topology::MAX_CPUS {
-        if hvm & (1u64 << c) != 0 && pv[c] != 0 {
+        if hvm & (1u128 << c) != 0 && pv[c] != 0 {
             div[c] = pv[c] * if vmm[c] { 4 } else { 2 };
         }
     }
@@ -255,7 +255,7 @@ fn publish_io_flags(h: &Vmmgr, arrival: Option<Arrival>) {
 /// `moves`: the guest's vCPUs that move, and where (a migration's);
 /// `vmm`: the CPU where its VMM is about to start (vmm_arriving).
 #[derive(Clone, Copy)]
-struct Arrival<'a> { guest: usize, cores: u64, moves: &'a [(usize, usize)], vmm: Option<usize> }
+struct Arrival<'a> { guest: usize, cores: u128, moves: &'a [(usize, usize)], vmm: Option<usize> }
 
 fn occupied(h: &Vmmgr, arrival: Option<Arrival>) -> [u64; topology::MAX_CPUS] {
     let mut cores = [0; topology::MAX_CPUS];
@@ -264,7 +264,7 @@ fn occupied(h: &Vmmgr, arrival: Option<Arrival>) -> [u64; topology::MAX_CPUS] {
     }
     if let Some(a) = arrival.filter(|a| h.guest(a.guest).is_some_and(|g| g.state != State::Stopped)) {
         for (i, core) in cores.iter_mut().enumerate() {
-            if a.cores & (1u64 << i) != 0 { *core |= 1u64 << a.guest; }
+            if a.cores & (1u128 << i) != 0 { *core |= 1u64 << a.guest; }
         }
     }
     cores
@@ -305,7 +305,7 @@ fn protect(h: &mut Vmmgr, arrival: Option<Arrival>) {
 pub fn start(h: &mut Vmmgr, gid: usize) -> Result<(), Errno> {
     let g = h.guest(gid).ok_or(l4h_host::wire::NO_REPLY)?;
     if g.state != State::Created { return Err(EINVAL); }
-    let cores = g.vcpus.iter().fold(0, |cores, v| cores | (1u64 << v.core));
+    let cores = g.vcpus.iter().fold(0, |cores, v| cores | (1u128 << v.core));
     protect(h, Some(Arrival { guest: gid, cores, moves: &[], vmm: None }));
     let g = h.guests[gid].as_mut().unwrap();
     // The READY caller is this guest's VMM. If protection stopped it,
@@ -334,7 +334,7 @@ fn hvm_monitor_core(h: &Vmmgr, g: &Guest) -> usize {
         for v in &o.vcpus { load[v.core] += 2; }
         if let Some((core, _)) = o.vmm_limits { load[core] += 1; }
     }
-    let own = g.vcpus.iter().fold(0u64, |m, v| m | (1 << v.core));
+    let own = g.vcpus.iter().fold(0u128, |m, v| m | (1 << v.core));
     let topo = &h.info.topology;
     // An SMT sibling of the guest's own vCPUs shares their core as a vCPU
     // would; core 0 has the system's services (logd, netd, vmmgr), and
@@ -415,8 +415,8 @@ pub fn set_cap(h: &mut Vmmgr, gid: usize, cap_pct: u32) -> Result<(), Errno> {
 
 const _: () = assert!(crate::MAX_GUESTS <= policy::MAX_GUESTS);
 const _: () = assert!(crate::MAX_GUESTS <= u64::BITS as usize);
-// policy::swap_moves keeps a guest's moved vCPUs in a word.
-const _: () = assert!(l4h_abi::MAX_VCPUS <= u64::BITS as usize);
+// policy::swap_moves keeps a guest's moved vCPUs in a u128.
+const _: () = assert!(l4h_abi::MAX_VCPUS <= u128::BITS as usize);
 const _: () = assert!(sel4::sel4_cfg_usize!(MAX_NUM_NODES) <= topology::MAX_CPUS);
 
 /// The balancer's samples, one per vCPU: too large for root's stack
@@ -590,7 +590,7 @@ pub fn balance(h: &mut Vmmgr, elapsed_us: u64, now: u64) {
         // least a quarter.  Elsewhere a demoted spinner keeps shielding an
         // I/O neighbour that uses less (DESIGN.md §7.1).
         let old = vmm_before[g.id].expect("VMM limits");
-        let boosted = if hvm & (1u64 << core) != 0 {
+        let boosted = if hvm & (1u128 << core) != 0 {
             g.vmm_guard.boost_when(g.vmm_boosted, vmm_used[g.id], core_vmm[core] + core_pvk[core], largest_boosted[core],
                 contended, elapsed_us, old, budget::Crowded::BesideHvm)
         } else {
@@ -631,7 +631,7 @@ fn migrate(h: &mut Vmmgr, action: policy::Action, moves: &[(usize, usize)]) {
         policy::Action::IntraCore { guest, .. } | policy::Action::VcoreSwap { guest, .. } => guest,
     };
     // The destinations alone: the sources are the vCPUs' own still.
-    let cores = moves.iter().fold(0u64, |m, &(_, dst)| m | 1u64 << dst);
+    let cores = moves.iter().fold(0u128, |m, &(_, dst)| m | 1u128 << dst);
     if !h.guest(gid).is_some_and(|g| g.state == State::Running) { return; }
     // Keep source protection until the move commits, and protect the
     // destinations before their first runnable guest arrives.

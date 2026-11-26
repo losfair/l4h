@@ -46,7 +46,7 @@ pub const SLOT_XCHG: u64 = 32;
 pub const XCHG_SLOTS: usize = 32;
 /// SchedControl of core c: SLOT_SCHED_CONTROL + c.
 pub const SLOT_SCHED_CONTROL: u64 = 64;
-pub const MAX_CORES: usize = 64;
+pub const MAX_CORES: usize = 128;
 /// ASID pools: SLOT_ASID_POOL + i, `VmmgrConfig::asid_pools` of them.
 pub const SLOT_ASID_POOL: u64 = SLOT_SCHED_CONTROL + MAX_CORES as u64;
 pub const MAX_ASID_POOLS: usize = 8;
@@ -68,7 +68,7 @@ pub const fn vmmgr_asid_pools(total: usize, root: usize) -> usize {
 pub const SLOT_VMM_MEMD_EP: u64 = SLOT_ASID_POOL + MAX_ASID_POOLS as u64;
 /// The guests' VMMs' serial lanes, dom0's included (serial::VMM_PAGES
 /// frames, from page 0 of serial::Lanes), each mapped into its own VMM.
-pub const SLOT_SERIAL_FRAMES: u64 = 256;
+pub const SLOT_SERIAL_FRAMES: u64 = 320;
 const SERIAL_FRAMES: usize = crate::serial::VMM_PAGES;
 /// The VMMs' log lanes (log::VMM_PAGES frames, from page 0 of the log
 /// area), each mapped into its VMM.

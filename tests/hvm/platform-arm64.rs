@@ -546,7 +546,7 @@ fn guest_boots_and_uses_the_machine() {
     c0.hw().s.gprs[GPR_PC] = old;
     c0.hw().s.gprs[GPR_PSTATE] = 0x3c5;
     // Nothing there reads as ones.
-    assert_eq!(mmio(&mut c0, 0, 0x0a00_0000, 4, None), 0xffff_ffff);
+    assert_eq!(mmio(&mut c0, 0, 0x0904_0000, 4, None), 0xffff_ffff);
 
     // ---- The GIC, as Linux sets it up.
     if v3 {

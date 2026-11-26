@@ -996,6 +996,14 @@ impl Pci {
         #[cfg(target_arch = "aarch64")]
         for (n, b) in bars.iter_mut().enumerate() {
             if b.size == 0 || b.is_io { continue; }
+            // No aperture to place it in (a machine without QEMU virt's,
+            // fdt::from_acpi): where the firmware put it, if it did.
+            if self.bar_limit == 0 {
+                if b.addr == 0 {
+                    *b = Bar::default();
+                }
+                continue;
+            }
             // The size is the device's: a power of two, and the BAR must fit.
             let bar_limit = self.bar_limit;
             let align = b.size.max(4096);
@@ -1221,7 +1229,13 @@ impl Pci {
         let hw = crate::fdt::hw();
         let (ecam_paddr, ecam_size) = hw.pci_ecam;
         let (bar_start, bar_limit) = hw.pci_mmio32;
-        let frames = devmem.frames(&mut alloc.slots, ecam_paddr, ecam_size).expect("PCI ECAM frames");
+        // No ECAM (none found, or not device memory): no PCI devices.
+        let frames = (ecam_size != 0).then(|| devmem.frames(&mut alloc.slots, ecam_paddr, ecam_size)).flatten();
+        let Some(frames) = frames else {
+            log!("l4h-root: no PCI ECAM at {:#x}+{:#x}: no PCI devices", ecam_paddr, ecam_size);
+            return Self { next_bar: core::cell::Cell::new(bar_start), ecam_buses: 0, bar_limit };
+        };
+        assert!(ecam_size <= crate::layout::ECAM.size);
         for (n, frame) in frames.map(crate::devmem::granule).enumerate() {
             crate::vspace::map_frame(&mut ObjCtx::global(alloc), slot::VSPACE.cap(), frame,
                 Self::ECAM_VA + n * 4096, CapRights::read_write(), VmAttributes::EXECUTE_NEVER);
