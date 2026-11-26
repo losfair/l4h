@@ -6461,7 +6461,7 @@ tools/build-fl4.sh
 SEL4_PREFIX="$PWD/build/sel4-fl4" L4H_KERNEL_VARIANT=fl4 tests/run-selftest.sh 4
 ```
 
-The tested FL4 revision is `8ff226f6c02ed8cec7278b1d2d8bdeb33df89f4e`.
+The tested FL4 revision is `741f1dfbcda825ae2e5468cd05f8ea678e82fcbf`.
 `prepare-fl4.sh` clones the pinned public revision, or the frozen override,
 into `build/FL4-src-<revision>`, one tree per revision, without applying
 any kernel patches. The source worktree is not edited.
