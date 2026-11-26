@@ -44,6 +44,7 @@
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/spinlock.h>
+#include <linux/percpu.h>
 #include <linux/slab.h>
 #include <linux/bitmap.h>
 #include <linux/list.h>
@@ -516,25 +517,97 @@ static void __slot_free(unsigned long cptr)
 	l2_free_slots++;
 }
 
+/*
+ * Each vCPU keeps a few free slots of its own.  Every page fault takes a
+ * slot for its mapping (vspace.c) and every unmap gives one back, and with
+ * one global caps_lock, held at times across seL4 calls (l2_add()'s retype,
+ * __l2_trim()'s delete, object retypes), 32 or more vCPUs faulting at once
+ * queued on it long enough that their PV spinlock waits blocked (smpbench
+ * fault_4k on a c4a-standard-64: about 50k blocked waits a second).  Now
+ * the lock is taken once per SLOT_CACHE / 2 slots.  A cached slot is still
+ * marked used in its CNode, so the CNode is not trimmed while a cache
+ * holds it; all caches together hold at most nr_cpu_ids * SLOT_CACHE.
+ */
+#define SLOT_CACHE	32
+
+struct slot_cache {
+	unsigned int n;
+	unsigned long slot[SLOT_CACHE];
+};
+
+static DEFINE_PER_CPU(struct slot_cache, slot_cache);
+
+/* Not before the per-CPU areas exist: a slot cached in the boot vCPU's
+ * template copy would be every vCPU's once the areas are copied from it.
+ * Early initcalls run after setup_per_cpu_areas(), before smp_init(). */
+static bool slot_cache_on __read_mostly;
+
+static int __init slot_cache_init(void)
+{
+	slot_cache_on = true;
+	return 0;
+}
+early_initcall(slot_cache_init);
+
 unsigned long l4h_slot_alloc(void)
 {
-	unsigned long flags, s;
+	struct slot_cache *c;
+	unsigned long flags, s = 0;
 
-	raw_spin_lock_irqsave(&caps_lock, flags);
-	s = __slot_alloc();
-	raw_spin_unlock_irqrestore(&caps_lock, flags);
+	if (!READ_ONCE(slot_cache_on)) {
+		raw_spin_lock_irqsave(&caps_lock, flags);
+		s = __slot_alloc();
+		raw_spin_unlock_irqrestore(&caps_lock, flags);
+		return s;
+	}
+	local_irq_save(flags);
+	c = this_cpu_ptr(&slot_cache);
+	if (!c->n) {
+		raw_spin_lock(&caps_lock);
+		while (c->n < SLOT_CACHE / 2) {
+			s = __slot_alloc();
+			if (!s)
+				break;
+			c->slot[c->n++] = s;
+		}
+		raw_spin_unlock(&caps_lock);
+	}
+	s = c->n ? c->slot[--c->n] : 0;
+	local_irq_restore(flags);
 	return s;
 }
 EXPORT_SYMBOL_GPL(l4h_slot_alloc);
 
 void l4h_slot_free(unsigned long cptr)
 {
+	struct slot_cache *c;
 	unsigned long flags;
 
-	raw_spin_lock_irqsave(&caps_lock, flags);
+	if (!READ_ONCE(slot_cache_on)) {
+		raw_spin_lock_irqsave(&caps_lock, flags);
+		__slot_free(cptr);
+		__l2_trim(cptr);
+		raw_spin_unlock_irqrestore(&caps_lock, flags);
+		return;
+	}
+	local_irq_save(flags);
+	c = this_cpu_ptr(&slot_cache);
+	if (c->n < SLOT_CACHE) {
+		c->slot[c->n++] = cptr;
+		local_irq_restore(flags);
+		return;
+	}
+	raw_spin_lock(&caps_lock);
+	while (c->n > SLOT_CACHE / 2) {
+		unsigned long s = c->slot[--c->n];
+
+		__slot_free(s);
+		__l2_trim(s);
+	}
 	__slot_free(cptr);
 	__l2_trim(cptr);
-	raw_spin_unlock_irqrestore(&caps_lock, flags);
+	raw_spin_unlock(&caps_lock);
+	local_irq_restore(flags);
 }
 EXPORT_SYMBOL_GPL(l4h_slot_free);
 

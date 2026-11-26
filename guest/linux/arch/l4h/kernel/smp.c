@@ -146,6 +146,24 @@ EXPORT_SYMBOL(l4h_pv_spinlocks);
 EXPORT_SYMBOL(__pv_queued_spin_unlock);
 
 /*
+ * The time bound of a waiter's spin (asm/spinlock.h, pv_spin_start() and
+ * pv_spin_over()): the time counter at its start, and whether `us`
+ * microseconds have passed since.  With no counter rate, only the
+ * iteration bound ends a spin.
+ */
+unsigned long long l4h_spin_start(void)
+{
+	return l4h_rdtsc();
+}
+
+int l4h_spin_over(unsigned long long start, unsigned int us)
+{
+	unsigned long long hz = l4h_tsc_hz;
+
+	return hz && l4h_rdtsc() - start >= hz * us / 1000000;
+}
+
+/*
  * Switch to them while there is still one vCPU, so no lock is contended:
  * a lock taken before the switch and released after it was not waited for,
  * and is released the same either way.

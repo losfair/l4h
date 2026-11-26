@@ -1,0 +1,65 @@
+--- a/kernel/locking/qspinlock_paravirt.h
++++ b/kernel/locking/qspinlock_paravirt.h
+@@ -283,6 +283,20 @@
+ }
+ 
+ /*
++ * An architecture may bound the spins below by time as well: what an
++ * iteration costs depends on the CPU (an x86 PAUSE takes tens to over a
++ * hundred cycles, an arm64 YIELD a few), so one count is too short on one
++ * CPU or too long on another (l4h).  pv_spin_start() starts a spin, and
++ * pv_spin_over() every PV_SPIN_CHECK + 1 iterations ends it early.
++ * SPIN_THRESHOLD stays the bound in iterations.
++ */
++#ifndef pv_spin_start
++#define pv_spin_start()		0ULL
++#define pv_spin_over(start)	false
++#endif
++#define PV_SPIN_CHECK		0xff
++
++/*
+  * Wait for node->locked to become true, halt the vcpu after a short spin.
+  * pv_kick_node() is used to set _Q_SLOW_VAL and fill in hash table on its
+  * behalf.
+@@ -292,9 +306,11 @@
+ 	struct pv_node *pn = (struct pv_node *)node;
+ 	struct pv_node *pp = (struct pv_node *)prev;
+ 	bool wait_early;
++	u64 start;
+ 	int loop;
+ 
+ 	for (;;) {
++		start = pv_spin_start();
+ 		for (wait_early = false, loop = SPIN_THRESHOLD; loop; loop--) {
+ 			if (READ_ONCE(node->locked))
+ 				return;
+@@ -302,6 +318,8 @@
+ 				wait_early = true;
+ 				break;
+ 			}
++			if (!(loop & PV_SPIN_CHECK) && pv_spin_over(start))
++				break;
+ 			cpu_relax();
+ 		}
+ 
+@@ -401,6 +419,7 @@
+ 	struct pv_node *pn = (struct pv_node *)node;
+ 	struct qspinlock **lp = NULL;
+ 	int waitcnt = 0;
++	u64 start;
+ 	int loop;
+ 
+ 	/*
+@@ -427,9 +446,12 @@
+ 		 * disable lock stealing before attempting to acquire the lock.
+ 		 */
+ 		set_pending(lock);
++		start = pv_spin_start();
+ 		for (loop = SPIN_THRESHOLD; loop; loop--) {
+ 			if (trylock_clear_pending(lock))
+ 				goto gotlock;
++			if (!(loop & PV_SPIN_CHECK) && pv_spin_over(start))
++				break;
+ 			cpu_relax();
+ 		}
+ 		clear_pending(lock);
