@@ -99,6 +99,18 @@ for d in 1 2 1 2; do
     l4hctl destroy "$id" || fail "destroy dmacheck"
     echo "CTLTEST: disk $d destroyed under I/O, no stale DMA"
 done
+# Zeroing (disk 1 virtio-blk: written zeros; disk 2 NVMe: Write Zeroes):
+# 3 MiB of the pattern, more than one call's staging, read back through a
+# window with the 4 KiB on either side, which keep the pattern.
+for d in 1 2; do
+    l4hctl disk-zero $d 8192 6144 || fail "disk-zero $d"
+    id=$(l4hctl create zerocheck --initrd /bin/vm.cpio.gz --mem 128 --disk $d,ro,start=8184,sectors=6160 \
+        --cmdline "console=hvc0 l4htest=zerocheck") || fail "create zerocheck $d"
+    l4hctl console "$id" --until "GUEST: zero check done" --timeout "$((60 * slow))" > /tmp/out || fail "zerocheck $d"
+    grep -q "GUEST: nonzero bytes 8192 of 3153920" /tmp/out || { cat /tmp/out; fail "disk $d zeroed"; }
+    l4hctl destroy "$id" || fail "destroy zerocheck $d"
+    echo "CTLTEST: disk $d zeroed, nothing beside it"
+done
 /bin/flags-test dom0 no-tpm || fail "flags without TPM"
 l4hctl disks
 if [ "$(uname -m)" = aarch64 ]; then

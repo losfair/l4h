@@ -111,6 +111,11 @@ pub const BLKD_SLOT_CLIENT_DONE: u64 = 32;
 pub const MAX_CLIENTS: usize = 512;
 pub const CHANNEL_PAGES: usize = core::mem::size_of::<Channel>().div_ceil(4096);
 pub const STAGING_SIZE: usize = 1 << 20;
+/// The most one `Zero` request covers (abi::CTL_ZERO_MAX bytes).
+pub const ZERO_MAX_SECTORS: u64 = (1 << 30) / 512;
+/// About how long one `Zero` request keeps the device before it answers
+/// with what it has zeroed: dom0's control calls go one at a time.
+pub const ZERO_SLICE_MS: u64 = 100;
 use crate::badges::driver as recv;
 use crate::errno::{EBUSY, EINVAL, ENOSPC, Errno};
 
@@ -158,6 +163,14 @@ crate::protocol! {
         Extent / extent = 8 from [Root] (client: usize, k: usize) -> (u64, u64);
         /// Discard an unattached range of a unit: the same status as Write.
         Discard / discard = 9 from [Root] (sector: u64, sectors: u64, unit: usize) -> u64;
+        /// Zero a prefix of the unattached, 4 KiB aligned range `sector`,
+        /// `sectors` (at most ZERO_MAX_SECTORS) of `unit`: the same status
+        /// as Write, and how many sectors from `sector` on now read zero
+        /// (all, or what one ZERO_SLICE_MS allowed; never none on success).
+        /// By the device's Write Zeroes where it has one, else by writing
+        /// staging, which root fills with zeros: never by discard, after
+        /// which reads return unspecified data.
+        Zero / zero = 10 from [Root] (sector: u64, sectors: u64, unit: usize) -> (u64, u64);
         /// `crate::TEST_INJECT` only: stop for good without failing, as a
         /// compromised blkd might.
         TestHang / test_hang = 0x7e58 from [Root] () -> ();

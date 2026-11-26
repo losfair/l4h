@@ -326,6 +326,8 @@ pub const CTL_TAKEN_OFF: usize = 4088;
 const _: () = assert!(CTL_RESP_OFF + core::mem::size_of::<CtlResp>() <= CTL_TAKEN_OFF);
 pub const CTL_DATA_MAX: usize = 1984;
 pub const CTL_LOAD_MAX: u64 = 1 << 20;
+/// The most bytes one zeroing BLK_WRITE (zero = 1) may ask for.
+pub const CTL_ZERO_MAX: u64 = 1 << 30;
 pub const CTL_NAME_MAX: usize = 32;
 
 #[repr(C)]

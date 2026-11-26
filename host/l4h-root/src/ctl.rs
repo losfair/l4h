@@ -69,12 +69,20 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
         }
         abi::CTL_BLK_WRITE => {
             let (disk, sector, len, zero) = (a[0] as usize, a[1], a[2] as usize, a[3]);
-            if a[2] > abi::CTL_LOAD_MAX || zero > 1 { return Err(EINVAL); }
+            // Zeroing takes a larger range than a write (blkd answers what it
+            // zeroed); a zero length flushes, either way.
+            let max = if zero == 1 && len != 0 { abi::CTL_ZERO_MAX } else { abi::CTL_LOAD_MAX };
+            if a[2] > max || zero > 1 { return Err(EINVAL); }
             h.ensure_disk(disk)?;
-            // dom0's control data area, which root maps read-only.
-            let from = (zero == 0).then_some(crate::vmmgr::CTL_DATA_VA as *const u8);
             let t = crate::vmmgr::op_new(h, None, h.disks[disk].ctrl)?;
-            if let Err(e) = crate::blkd::write(h, disk, sector, len, from, t) {
+            let r = if zero == 1 && len != 0 {
+                if len % 4096 != 0 { Err(EINVAL) } else { crate::blkd::zero(h, disk, sector, a[2] / 512, t) }
+            } else {
+                // dom0's control data area, which root maps read-only.
+                let from = (zero == 0).then_some(crate::vmmgr::CTL_DATA_VA as *const u8);
+                crate::blkd::write(h, disk, sector, len, from, t)
+            };
+            if let Err(e) = r {
                 h.ops[t] = None;
                 return Err(e);
             }

@@ -6,6 +6,7 @@ use core::ops::Range;
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use l4h_abi as abi;
 use l4h_host::errno::Errno;
 use l4h_virtio::Mmio;
 use sel4::{CapRights, VmAttributes, cap, cap_type};
@@ -137,9 +138,21 @@ enum BlkOp {
     Check { token: usize, id: usize, instance: u64, disk: usize, unit: u64, start: u64, n: usize, volatile: bool, claims: bool },
     Add { token: usize, chan: Channel, kick: cap::Notification },
     Remove { client: usize },
-    Provision { token: usize, discard: bool },
+    Provision { token: usize, kind: Provision },
     Extent { token: usize, vals: [u64; 6] },
 }
+
+/// What a provisioning request (BLK_WRITE, BLK_DISCARD) asked blkd for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Provision {
+    /// A write of staging, or a flush.
+    Write,
+    Discard,
+    /// Zeros, from staging filled with them or by the device's own command.
+    Zero,
+}
+
+const _: () = assert!(abi::CTL_ZERO_MAX == blk::ZERO_MAX_SECTORS * 512);
 
 /// How blkd's requests fail once it has.
 const FAILED: host::mailbox::Reply = host::mailbox::Reply::FAILED;
@@ -940,9 +953,9 @@ pub fn write(h: &mut Host, disk: usize, sector: u64, len: usize, from: Option<*c
     if ctrl.staging_busy || !ctrl.room() { return Err(ctl::EBUSY); }
     ctrl.stage(from, len, &mut h.wins.a);
     let r = if len == 0 {
-        ctrl.post(Request::Flush { unit: unit as usize }, BlkOp::Provision { token, discard: false })
+        ctrl.post(Request::Flush { unit: unit as usize }, BlkOp::Provision { token, kind: Provision::Write })
     } else {
-        ctrl.post(Request::Write { sector, length: len, unit: unit as usize }, BlkOp::Provision { token, discard: false })
+        ctrl.post(Request::Write { sector, length: len, unit: unit as usize }, BlkOp::Provision { token, kind: Provision::Write })
     };
     r.map_err(|_| ctl::EBUSY)?;
     ctrl.staging_busy = true;
@@ -954,8 +967,24 @@ pub fn discard(h: &mut Host, disk: usize, sector: u64, sectors: u64, token: usiz
     let (c, unit) = (h.disks[disk].ctrl, h.disks[disk].unit);
     let ctrl = &mut h.ctrls[c];
     if ctrl.failed { return Err(ctl::EIO); }
-    ctrl.post(Request::Discard { sector, sectors, unit: unit as usize }, BlkOp::Provision { token, discard: true })
+    ctrl.post(Request::Discard { sector, sectors, unit: unit as usize }, BlkOp::Provision { token, kind: Provision::Discard })
         .map_err(|_| ctl::EBUSY)
+}
+
+/// Ask blkd to zero a prefix of an unattached range (blk::call::Zero), for
+/// pending request `token`, whose answer is the bytes zeroed.  Staging is
+/// filled with zeros for the writes blkd makes when the device cannot zero
+/// by itself.
+pub fn zero(h: &mut Host, disk: usize, sector: u64, sectors: u64, token: usize) -> Result<(), Errno> {
+    let (c, unit) = (h.disks[disk].ctrl, h.disks[disk].unit);
+    let ctrl = &mut h.ctrls[c];
+    if ctrl.failed { return Err(ctl::EIO); }
+    if ctrl.staging_busy || !ctrl.room() { return Err(ctl::EBUSY); }
+    ctrl.stage(None, blk::STAGING_SIZE, &mut h.wins.a);
+    ctrl.post(Request::Zero { sector, sectors, unit: unit as usize }, BlkOp::Provision { token, kind: Provision::Zero })
+        .map_err(|_| ctl::EBUSY)?;
+    ctrl.staging_busy = true;
+    Ok(())
 }
 
 /// Make controller `c`'s blkd stop answering, for tests/run-hangtest.sh,
@@ -1022,18 +1051,30 @@ fn complete(h: &mut Host, c: usize, op: BlkOp, w: host::mailbox::Reply) {
             }
             r => removed(h, c, client, r.is_ok()),
         },
-        BlkOp::Provision { token, discard } => {
+        BlkOp::Provision { token, kind } => {
             let ctrl = &mut h.ctrls[c];
-            let status = if discard {
-                wire::reply::<reply::Discard>(&w)
-            } else {
-                ctrl.staging_busy = false;
+            // The bytes a zeroing request zeroed: its answer to dom0.
+            let mut zeroed = 0;
+            let status = match kind {
+                Provision::Discard => wire::reply::<reply::Discard>(&w),
                 // Flush's reply is write's.
-                wire::reply::<reply::Write>(&w)
+                Provision::Write => {
+                    ctrl.staging_busy = false;
+                    wire::reply::<reply::Write>(&w)
+                }
+                Provision::Zero => {
+                    ctrl.staging_busy = false;
+                    wire::reply::<reply::Zero>(&w).map(|(status, sectors)| {
+                        zeroed = sectors.saturating_mul(512);
+                        // Success zeroes something: none would have dom0 ask forever.
+                        if status == 0 && sectors == 0 { blk::STATUS_IOERR as u64 } else { status }
+                    })
+                }
             };
             let r = match status {
+                Ok(0) if kind == Provision::Zero => Ok(OpResult::Vals([zeroed].into_iter().collect())),
                 Ok(0) => Ok(OpResult::Vals(Default::default())),
-                Ok(s) if discard && s == blk::STATUS_UNSUPP as u64 => Ok(OpResult::Vals(Default::default())),
+                Ok(s) if kind == Provision::Discard && s == blk::STATUS_UNSUPP as u64 => Ok(OpResult::Vals(Default::default())),
                 // The device failed, or blkd did.
                 Ok(u64::MAX) | Err(wire::FAILED) => {
                     quarantine(ctrl, &h.pci);

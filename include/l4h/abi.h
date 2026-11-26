@@ -534,6 +534,7 @@ enum l4h_mem_op {
 #define L4H_CTL_TAKEN_OFF       4088    /* after the response */
 #define L4H_CTL_DATA_MAX        1984
 #define L4H_CTL_LOAD_MAX        (1u << 20)
+#define L4H_CTL_ZERO_MAX        (1u << 30)  /* BLK_WRITE with zero = 1 */
 #define L4H_CTL_NAME_MAX        32
 
 struct l4h_ctl_req {
@@ -617,9 +618,15 @@ enum l4h_ctl_op {
 	/* args: vm -> vals[0] = CPU used in the last 100 ms (permille of a core,
 	 * all vCPUs and the VMM), vals[1] = CPU cap (percent per vCPU, 0 = none) */
 	L4H_CTL_VM_STATS = 18,
-    /* disk, sector, bytes (0 = flush, max L4H_CTL_LOAD_MAX), zero (0/1).
-     * Writes the control data buffer or zeros to an UNATTACHED range.
-     * Sector and length must be 4 KiB aligned. */
+    /* disk, sector, bytes (0 = flush), zero (0/1).
+     * Writes the control data buffer (bytes at most L4H_CTL_LOAD_MAX) or
+     * zeros to an UNATTACHED range.  Sector and length must be 4 KiB
+     * aligned.  Zeroing takes up to L4H_CTL_ZERO_MAX bytes and may stop
+     * short: vals[0] = the bytes zeroed from sector on (more than 0; the
+     * caller asks again for the rest).  Zeroed bytes read zero after, by
+     * the device's Write Zeroes or by writing zeros.  Hosts before
+     * L4H_CTL_ZERO_MAX refuse more than L4H_CTL_LOAD_MAX (EINVAL) and
+     * answer vals[0] = 0 for all of it. */
     L4H_CTL_BLK_WRITE = 20,
     /* disk, cursor (0 = first) -> vals: next (0 = end), vm, start, sectors,
      * read-only, extent: one row per window, or per extent (in guest order,

@@ -2714,7 +2714,19 @@ extent.
 - **Provisioning.** dom0 can seed or explicitly zero *unattached* ranges
   with `BLK_WRITE` and its ioctl staging buffer (up to 1 MiB per call); a
   zero-length call flushes the controller. Provisioning uses a private 1 MiB
-  DMA scratch area for writes. `BLK_DISCARD` takes a disk index, a start
+  DMA scratch area for writes. Zeroing takes up to 1 GiB per call
+  (`CTL_ZERO_MAX`) and answers how much of it, from the start, it zeroed:
+  blkd stops after about 100 ms of device time (dom0's control calls go one
+  at a time) and dom0 asks again for the rest. blkd zeroes with the
+  device's own command where it has one: NVMe Write Zeroes (ONCS), up to
+  the controller's WZSL or else MDTS per command, with DEAC only where the
+  namespace says deallocated blocks read zero (DLFEAT), never on a
+  namespace with protection information. Otherwise, and on a unit whose
+  Write Zeroes failed once, it writes the scratch area, filled with zeros by
+  root, a MiB at a time. Either way the range reads zero after; a discard
+  is never taken for zeroing. Hosts before `CTL_ZERO_MAX` refuse a zeroing
+  call over 1 MiB with `EINVAL` and answer 0 for the whole range, and
+  `l4hctl`'s `disk_zero` then goes on a MiB at a time. `BLK_DISCARD` takes a disk index, a start
   sector, and a sector count. blkd checks the full 4 KiB aligned range against
   attached and reserved windows. It splits the discard at the device limit.
   An unsupported discard succeeds without changing the disk. Reads after
