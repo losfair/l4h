@@ -16,9 +16,11 @@ import time
 
 TITLE = "biostest dashboard title"
 DEFAULT = "l4h"
-# 1024 pixels wide: 8x8 glyphs doubled vertically; the title starts at
-# column 1 of row 0 (host/l4h-root/src/dashboard.rs).
-WIDTH, CELL_W, CELL_H, FIRST_COL = 1024, 8, 16, 1
+# 8x8 glyphs doubled vertically, and horizontally too from 1280 pixels of
+# width; the title starts at column 1 of row 0
+# (host/l4h-root/src/dashboard.rs).  The width is the boot's: seL4 asks GRUB
+# for 1024x768, FL4 for no size and gets the display's preferred one.
+CELL_H, FIRST_COL = 16, 1
 # The dashboard redraws within 100 ms of a new title, and every second.
 SETTLE = 2
 DEADLINE = time.monotonic() + 180
@@ -74,13 +76,14 @@ def screenshot(stream, path):
         pos = end + 1
     assert fields[0] == b"P6" and fields[3] == b"255", fields
     width, height = int(fields[1]), int(fields[2])
-    assert width == WIDTH and len(data) - pos == width * height * 3, (width, height, len(data) - pos)
+    assert width >= 640 and len(data) - pos == width * height * 3, (width, height, len(data) - pos)
     return [data[pos + y * width * 3:pos + (y + 1) * width * 3] for y in range(height)]
 
 
 def blank(rows, first, count):
     """Whether cells `first` to `first + count` of the title bar hold no glyph."""
-    lo, hi = first * CELL_W * 3, (first + count) * CELL_W * 3
+    cell_w = 16 if len(rows[0]) // 3 >= 1280 else 8
+    lo, hi = first * cell_w * 3, (first + count) * cell_w * 3
     pixels = {row[x:x + 3] for row in rows[:CELL_H] for x in range(lo, hi, 3)}
     return len(pixels) == 1
 
