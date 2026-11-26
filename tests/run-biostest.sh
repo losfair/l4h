@@ -52,7 +52,9 @@ done
 wait "$qemu" 2>/dev/null || true
 rm -f "$qmp"
 grep -aE "IMAGETEST|module '|dashboard|disk [0-9]|nic [0-9]|memory:|cores:|l4h-root: [0-9]+ core|panic" "$log" || true
-grep -aq "l4h-root: dashboard on 1024x768 framebuffer" "$log"
+# seL4 asks GRUB for 1024x768 (patch 0011); FL4 names no size and gets the
+# display's preferred mode.  tests/dashboard-qemu.py follows either.
+grep -aEq "l4h-root: dashboard on [0-9]+x[0-9]+ framebuffer" "$log"
 grep -aq "IMAGETEST: cmdline .*imagetest=bios" "$log"
 grep -aq "IMAGETEST: network ok" "$log"
 wait "$screen"
