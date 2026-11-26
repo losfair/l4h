@@ -130,6 +130,13 @@ pathlib.Path(args[args.index('-o') + 1]).write_bytes(b'EFI fixture')
         self.assertNotIn('terminal_input', config)
         self.assertIn('insmod regexp', config)
         self.assertIn('echo "l4h: boot failed"\nexit\n', config)
+        # FL4 boots from the same script, its kernel stripped as in its EFI.
+        fl4 = self.work / 'bios-fl4'
+        subprocess.run([str(ROOT / 'tools/mkbios.sh'), str(fl4), str(fixture), str(fixture)],
+                       env=dict(env, L4H_KERNEL_VARIANT='fl4'), check=True, capture_output=True)
+        self.assertEqual((fl4 / 'grub.cfg').read_text(), config)
+        self.assertEqual((fl4 / 'kernel.elf').read_bytes(), (out / 'l4h-root.elf').read_bytes())
+        self.assertFalse((fl4 / 'mk').exists())
         src = config.index('source "$l4h/l4h.conf"')
         self.assertLess(config.index('l4h_selected="$l4h"'), src)
         self.assertIn('l4h="$l4h_selected"', config[src:src + 100])

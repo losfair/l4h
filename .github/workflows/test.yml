@@ -569,6 +569,12 @@ jobs:
           grep -aq 'FL4: seL4 17.0 (MCS) API kernel' build/qemu-uefi.log
           grep -aq "IMAGETEST: SDK mounted" build/qemu-uefi.log
           PLATFORM_FL4_EFI=build/l4h-fl4.efi tests/run-platformtest.sh
+      - name: BIOS boot of FL4 (GRUB multiboot2)
+        run: |
+          # The same binaries as BIOS files, in the image of the step above.
+          L4H_KERNEL_VARIANT=fl4 tools/mkbios.sh build/bios-fl4
+          BIOS_FILES=build/bios-fl4 UEFI_EFI=build/l4h-fl4.efi tests/run-biostest.sh
+          grep -aq 'FL4: seL4 17.0 (MCS) API kernel' build/qemu-bios.log
       - name: Upload logs
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4

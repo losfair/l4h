@@ -5,24 +5,36 @@
 # loads l4h's files, dom0's initramfs and l4h.conf from the EFI partition,
 # and multiboot2 sets up a framebuffer through VBE for the dashboard, whose
 # title dom0 sets (tests/dashboard-qemu.py).
+# BIOS_FILES=dir UEFI_EFI=app.efi tests prebuilt BIOS files (tools/mkbios.sh)
+# without rebuilding their stack; the image carries that application for
+# UEFI.  This is how FL4 is booted here (L4H_KERNEL_VARIANT=fl4 mkbios.sh).
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=$root/build/guest
 mkdir -p "$out"
-"$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
-    || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
-"$root/tools/build-sdk.sh" >/dev/null
+bios=${BIOS_FILES:-}
+image_args=()
+if [ -n "$bios" ]; then
+    efi=${UEFI_EFI:?BIOS_FILES needs UEFI_EFI, the UEFI application of the image}
+    [ -f "$bios/grub.cfg" ] || { echo "$bios/grub.cfg: missing" >&2; exit 1; }
+    [ -f "$efi" ] || { echo "$efi: missing" >&2; exit 1; }
+    image_args=(-b "$bios" -e "$efi")
+else
+    "$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
+        || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
+    "$root/tools/build-sdk.sh" >/dev/null
+fi
 "$root/tools/build-l4hctl.sh"
 "$root/tools/mkinitramfs.sh" "$out/bios.cpio.gz" "$root/tests/guest/init-image" \
     "$root/tools/l4hctl/target/release/l4hctl" "$root/tests/guest/udhcpc.script" >/dev/null
-env -u L4H_DOM0_DISKS -u L4H_DOM0_CMDLINE "$root/tools/build-host.sh"
+[ -n "$bios" ] || env -u L4H_DOM0_DISKS -u L4H_DOM0_CMDLINE "$root/tools/build-host.sh"
 # The boot disk is a host disk too: keep it away from dom0.
 cat > "$out/bios.conf" <<'CONF'
 # tests/run-biostest.sh
 dom0_disks=0
 dom0_cmdline="console=hvc0 imagetest=bios"
 CONF
-"$root/tools/mkimage.sh" -i "$out/bios.cpio.gz" \
+"$root/tools/mkimage.sh" "${image_args[@]}" -i "$out/bios.cpio.gz" \
     -c "$out/bios.conf" "$root/build/l4h-bios.raw"
 log=$root/build/qemu-bios.log
 qmp=$root/build/bios-qmp.sock

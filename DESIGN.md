@@ -5542,7 +5542,8 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
   only with SeaBIOS, such as DigitalOcean. BIOS GRUB's core image is read
   into conventional memory and must stay within a few hundred KiB, so it
   cannot hold l4h as a memdisk. `tools/mkbios.sh` builds l4h's files
-  instead: the seL4 kernel, `l4h-root`, the guest kernel, its build SDK
+  instead: the kernel (seL4, or FL4 with `L4H_KERNEL_VARIANT=fl4`),
+  `l4h-root`, the guest kernel, its build SDK
   and a `grub.cfg` that boots them like the UEFI script. They live in
   `bios/` of a directory `$l4h` that also holds `dom0/initrd` and
   `l4h.conf`. Two GRUBs can run that `grub.cfg`:
@@ -5558,6 +5559,16 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
   dashboard and `fb_console`. seL4 finds the ACPI tables in GRUB's
   multiboot2 tags. Nothing else differs: the kernel, root and the components
   do not depend on the firmware. There is no measured boot (§10.2).
+
+  FL4 boots from the same `grub.cfg`: its kernel has the multiboot2 header
+  and entry its UEFI loader also hands off to, takes the modules after the
+  root task as seL4 does with patch 0021, and searches the BIOS areas for
+  the RSDP when GRUB passes none. Its root task is the host built against
+  FL4's libsel4, not the seL4 variants'. What FL4's UEFI loader alone
+  provides is absent: the PCR 9 and RTMR measurements, and SEV-SNP and TDX
+  guests, which need its accepted memory and private tags. FL4 ignores
+  `console_port`/`debug_port` and writes its own output to COM1; the host's
+  output follows `serial_port` (§10.4).
 - **Disk image.** `tools/mkimage.sh` builds a GPT disk that boots under UEFI
   and BIOS: the ESP from 1 MiB, then a 1 MiB BIOS boot partition. The ESP
   holds `EFI/BOOT/BOOTX64.EFI` (the l4h application), `/l4h/bios` (l4h's BIOS
@@ -5586,8 +5597,9 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
   `SHA256SUMS`:
   - all four applications, in release mode, with the components packed
     without debug information;
-  - `l4h-bios-x86_64.tar.xz`: l4h's BIOS files, with each seL4 variant's kernel as
-    `kernel-VARIANT.elf`, for the installer;
+  - `l4h-bios-x86_64.tar.xz`: l4h's BIOS files, with each variant's kernel as
+    `kernel-VARIANT.elf` (FL4's is `kernel-fl4.elf`), the seL4 variants'
+    `l4h-root.elf` and FL4's `l4h-root-fl4.elf`, for the installer;
   - `l4h-dom0-x86_64.tar.xz` (`tools/build-dom0.sh`): the dom0 userspace
     package, a static `l4hctl`, an example `l4h.conf` and the installer
     (`install.py` and its static initramfs), for a dom0 of any distribution;
@@ -5620,7 +5632,8 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
    ESP, and dom0 gets DHCP through the uplink. `tests/run-biostest.sh` boots
    the same image as a DigitalOcean droplet would: SeaBIOS on i440fx, a
    transitional virtio-blk boot disk and virtio-net NIC, checking the VBE
-   framebuffer too.
+   framebuffer too. With `BIOS_FILES` and `UEFI_EFI` it boots prebuilt
+   files, which is how CI boots FL4 from BIOS GRUB.
 2. **GCP.**
    - N2 uses virtio-net and NVMe local SSDs. GCE's virtio-net is a legacy
      (0.9.5) device, and N2 attaches the boot disk and SCSI persistent disks
@@ -5741,12 +5754,13 @@ curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/install.sh |
 - **Release.** It uses `sudo` when needed, installs missing dependencies
   with apt, dnf or yum, and downloads a tagged GitHub release with SHA-256
   verification. No source build or hardware virtualization is needed.
-- **Variant.** UEFI installs use `fl4` (`l4h-fl4.efi`), which detects CPU
-  features and Meltdown at boot. BIOS installs and `--partitions` use seL4,
-  which FL4 lacks: preflight selects `skim-xapic-nopcid` for
+- **Variant.** Installs use `fl4` (`l4h-fl4.efi` on UEFI; `kernel-fl4.elf`
+  and `l4h-root-fl4.elf` of the BIOS package on BIOS), which detects CPU
+  features and Meltdown at boot. `--partitions` uses seL4, since FL4 runs
+  one kernel: preflight selects `skim-xapic-nopcid` for
   Meltdown-affected CPUs or when immunity cannot be established, and
   `generic` (x2APIC, PCID, INVPCID) or `xapic-nopcid` otherwise;
-  `--variant` selects one of these on UEFI too. All variants require
+  `--variant` selects one of these for a single-kernel install too. All variants require
   FSGSBASE, XSAVEOPT, AVX and 1 GiB pages. Updates keep the installed
   variant, so existing seL4 installs stay on seL4 until `--variant fl4`.
   Dom0 can switch to FL4 or SKIM; other switches need native Linux, so the
