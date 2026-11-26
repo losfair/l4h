@@ -999,7 +999,7 @@ mod tests {
             assert_eq!(audit(h, s, CAP_CNODE), Ok(()));
             assert!(audit(h, s, CAP_THREAD).is_err() && audit(h, s, 1).is_err());
         }
-        for v in [0, abi::MAX_VCPUS as u64 - 1] {
+        for v in [0, hvm::MAX_VCPUS as u64 - 1] {
             assert_eq!(audit(h, hvm::SLOT_VCPU_TCB + v, CAP_THREAD), Ok(()));
             assert_eq!(audit(h, hvm::SLOT_VCPU_OBJ + v, CAP_X86_VCPU), Ok(()));
             assert!(audit(h, hvm::SLOT_VCPU_OBJ + v, CAP_CNODE).is_err());
