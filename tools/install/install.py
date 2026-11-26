@@ -680,7 +680,8 @@ class Preflight:
         plan["config_mode"] = self.path(config).stat().st_mode & 0o777
         tracked = [STATE, config, payload]
         if firmware == "bios":
-            tracked.append(Path(plan["grubdir"]) / "custom.cfg")
+            # The root task changes with the variant, as the kernel does.
+            tracked += [payload.with_name("l4h-root.elf"), Path(plan["grubdir"]) / "custom.cfg"]
         plan["snapshot"] = {str(p): digest(self.path(p)) if self.path(p).is_file() else None for p in tracked}
         return plan
 

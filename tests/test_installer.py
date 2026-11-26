@@ -1554,6 +1554,12 @@ class BiosInstallerTests(UpdateChecks, Harness):
                 with self.subTest(variant=variant):
                     checksum = installer.digest(bios / ("kernel-" + variant + ".elf"))
                     self.assertEqual(installer.installed_variant("vold", "bios", checksum), variant)
+            # A release from before FL4 on BIOS has no kernel-fl4.elf.
+            (bios / "kernel-fl4.elf").unlink()
+            with tarfile.open(archive, "w:xz") as tar:
+                tar.add(bios, arcname=installer.BIOS_PACKAGE)
+            checksum = installer.digest(bios / "kernel-generic.elf")
+            self.assertEqual(installer.installed_variant("vold", "bios", checksum), "generic")
 
     def test_disk_full_before_grub(self):
         plan = self.check()

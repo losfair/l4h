@@ -5560,10 +5560,11 @@ injects these failures in a host built with `L4H_TEST_INJECT=1`;
   multiboot2 tags. Nothing else differs: the kernel, root and the components
   do not depend on the firmware. There is no measured boot (§10.2).
 
-  FL4 boots from the same `grub.cfg`: its kernel has the multiboot2 header
-  and entry its UEFI loader also hands off to, takes the modules after the
-  root task as seL4 does with patch 0021, and searches the BIOS areas for
-  the RSDP when GRUB passes none. Its root task is the host built against
+  FL4 boots from the same `grub.cfg`: its kernel has a multiboot2 header,
+  and its 32-bit entry reaches the same boot code, with the same multiboot2
+  information, as the 64-bit entry its UEFI loader jumps to. It takes the
+  modules after the root task as seL4 does with patch 0021, and searches
+  the BIOS areas for the RSDP when GRUB passes none. Its root task is the host built against
   FL4's libsel4, not the seL4 variants'. What FL4's UEFI loader alone
   provides is absent: the PCR 9 and RTMR measurements, and SEV-SNP and TDX
   guests, which need its accepted memory and private tags. FL4 ignores

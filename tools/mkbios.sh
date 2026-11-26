@@ -35,6 +35,8 @@ kernel=${3:-$root/build/sel4${L4H_KERNEL_VARIANT:+-$L4H_KERNEL_VARIANT}/bin/kern
 guest_kernel=${L4H_GUEST_KERNEL:-$root/build/linux-l4h/vmlinux}
 guest_sdk=${L4H_GUEST_SDK-$(dirname "$guest_kernel")/sdk.erofs}
 mkshim=${L4H_MKSHIM-$root/build/mkshim${L4H_KERNEL_VARIANT:+-$L4H_KERNEL_VARIANT}}
+# FL4 runs one kernel: never the shim, whatever L4H_MKSHIM names.
+[ "${L4H_KERNEL_VARIANT:-}" = fl4 ] && mkshim=
 source "$root/tools/mkshim-grub.sh"
 mkdir -p "$out"
 rm -rf "$out/sdk.erofs" "$out/mk"
