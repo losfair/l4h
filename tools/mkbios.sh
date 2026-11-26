@@ -17,6 +17,11 @@
 # instead (tools/mkshim-grub.sh, DESIGN.md §11.4), when it was built
 # (L4H_MKSHIM, default build/mkshim[-VARIANT]).
 # L4H_KERNEL_VARIANT selects a built seL4 variant when kernel.elf is omitted.
+# L4H_KERNEL_VARIANT=fl4 is FL4's kernel (tools/build-fl4.sh), which GRUB
+# boots through the same multiboot2 entry; l4h-root.elf must then be the
+# host built against FL4's libsel4 (SEL4_PREFIX=build/sel4-fl4), and there
+# is no multikernel shim.  FL4 writes its own output to COM1 whatever
+# serial_port says; the host's follows the setting.
 # Usage: mkbios.sh <outdir> [l4h-root.elf] [kernel.elf]
 # L4H_GUEST_KERNEL, L4H_GUEST_SDK, L4H_SERIAL_PORT and L4H_FB_CONSOLE are
 # as for tools/mkefi.sh.
@@ -30,6 +35,8 @@ kernel=${3:-$root/build/sel4${L4H_KERNEL_VARIANT:+-$L4H_KERNEL_VARIANT}/bin/kern
 guest_kernel=${L4H_GUEST_KERNEL:-$root/build/linux-l4h/vmlinux}
 guest_sdk=${L4H_GUEST_SDK-$(dirname "$guest_kernel")/sdk.erofs}
 mkshim=${L4H_MKSHIM-$root/build/mkshim${L4H_KERNEL_VARIANT:+-$L4H_KERNEL_VARIANT}}
+# FL4 runs one kernel: never the shim, whatever L4H_MKSHIM names.
+[ "${L4H_KERNEL_VARIANT:-}" = fl4 ] && mkshim=
 source "$root/tools/mkshim-grub.sh"
 mkdir -p "$out"
 rm -rf "$out/sdk.erofs" "$out/mk"
@@ -81,7 +88,12 @@ boot
 echo "l4h: boot failed"
 exit
 CFG
-cp "$kernel" "$out/kernel.elf"
+if [ "${L4H_KERNEL_VARIANT:-}" = fl4 ]; then
+    # As tools/mkfl4-release-efi.sh packs it.
+    objcopy --strip-debug "$kernel" "$out/kernel.elf"
+else
+    cp "$kernel" "$out/kernel.elf"
+fi
 # seL4 and root load only the segments: drop the debug information.
 objcopy --strip-debug "$rootserver" "$out/l4h-root.elf"
 objcopy --strip-debug "$guest_kernel" "$out/vmlinux"

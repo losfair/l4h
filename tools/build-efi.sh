@@ -13,8 +13,10 @@
 # the EFI system partition has /l4h/l4h-mk.conf (DESIGN.md §11.4).
 # L4H_RELEASE=1 builds release kernels and host components.
 # build/efi/l4h-bios-x86_64.tar.xz holds l4h's files for BIOS machines
-# (tools/mkbios.sh), with each variant's kernel as kernel-VARIANT.elf; the
-# Linux installer installs one as kernel.elf.
+# (tools/mkbios.sh), with each variant's kernel as kernel-VARIANT.elf, FL4's
+# (kernel-fl4.elf) included; the Linux installer installs one as kernel.elf.
+# The seL4 variants boot l4h-root.elf and FL4 l4h-root-fl4.elf, the host
+# built against FL4's libsel4.
 # build/efi/l4h-debug-x86_64.tar.xz holds the same build unstripped (root,
 # the components, each variant's kernel, its slot kernels as
 # kernel-VARIANT-sK.elf, the shim and the guest kernel, vmlinux), to
@@ -88,10 +90,6 @@ for v in "${variants[@]}"; do
     read -r name _ <<<"$v"
     cp "$root/build/sel4-$name/bin/kernel.elf" "$bios/kernel-$name.elf"
 done
-l4h_tar -C "$debug" -cJf "$out/l4h-bios-x86_64.tar.xz" l4h-bios-x86_64
-for f in l4h-debug-x86_64.tar.xz l4h-bios-x86_64.tar.xz; do
-    echo "$out/$f: $(( $(stat -c %s "$out/$f") >> 10 )) KiB"
-done
 # Reuse the same Linux kernel and SDK; only the host and its small
 # embedded ABI provider are rebuilt against FL4.
 guest_hash=$(sha256sum "$root/build/linux-l4h/vmlinux" "$root/build/linux-l4h/sdk.erofs")
@@ -100,3 +98,11 @@ if [ "$guest_hash" != "$(sha256sum "$root/build/linux-l4h/vmlinux" "$root/build/
     echo 'FL4 packaging changed the common Linux kernel or SDK' >&2
     exit 1
 fi
+# The host components are FL4's from here on: its root task and kernel
+# join the BIOS package, stripped as in l4h-fl4.efi.
+objcopy --strip-debug "$root/host/target/x86_64-sel4-roottask/$l4h_profile/l4h-root.elf" "$bios/l4h-root-fl4.elf"
+objcopy --strip-debug "$root/build/sel4-fl4/bin/kernel.elf" "$bios/kernel-fl4.elf"
+l4h_tar -C "$debug" -cJf "$out/l4h-bios-x86_64.tar.xz" l4h-bios-x86_64
+for f in l4h-debug-x86_64.tar.xz l4h-bios-x86_64.tar.xz; do
+    echo "$out/$f: $(( $(stat -c %s "$out/$f") >> 10 )) KiB"
+done

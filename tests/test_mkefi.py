@@ -120,7 +120,7 @@ pathlib.Path(args[args.index('-o') + 1]).write_bytes(b'EFI fixture')
         if not shutil.which('objcopy'):
             self.skipTest('no objcopy')
         fixture = self.work / 'fixture.elf'
-        subprocess.run(['cc', '-x', 'c', '-', '-o', str(fixture)], input='int main(void){return 0;}', text=True, check=True)
+        subprocess.run(['cc', '-g', '-x', 'c', '-', '-o', str(fixture)], input='int main(void){return 0;}', text=True, check=True)
         env['L4H_GUEST_KERNEL'] = str(fixture)
         subprocess.run([str(ROOT / 'tools/mkbios.sh'), str(out), str(fixture), str(fixture)], env=env, check=True,
                        capture_output=True)
@@ -130,6 +130,23 @@ pathlib.Path(args[args.index('-o') + 1]).write_bytes(b'EFI fixture')
         self.assertNotIn('terminal_input', config)
         self.assertIn('insmod regexp', config)
         self.assertIn('echo "l4h: boot failed"\nexit\n', config)
+        # FL4 boots from the same script, its kernel stripped as in its EFI.
+        fl4 = self.work / 'bios-fl4'
+        subprocess.run([str(ROOT / 'tools/mkbios.sh'), str(fl4), str(fixture), str(fixture)],
+                       env=dict(env, L4H_KERNEL_VARIANT='fl4'), check=True, capture_output=True)
+        self.assertEqual((fl4 / 'grub.cfg').read_text(), config)
+        self.assertEqual((fl4 / 'kernel.elf').read_bytes(), (out / 'l4h-root.elf').read_bytes())
+        self.assertLess((fl4 / 'kernel.elf').stat().st_size, (out / 'kernel.elf').stat().st_size)
+        # FL4 runs one kernel: a shim built for seL4 is left out.
+        shim = self.work / 'mkshim'
+        shim.mkdir()
+        for name in ['l4h-mkshim.elf'] + ['kernel-s%d.elf' % k for k in range(8)]:
+            shutil.copy(fixture, shim / name)
+        subprocess.run([str(ROOT / 'tools/mkbios.sh'), str(fl4), str(fixture), str(fixture)],
+                       env=dict(env, L4H_KERNEL_VARIANT='fl4', L4H_MKSHIM=str(shim)), check=True, capture_output=True)
+        self.assertEqual((fl4 / 'grub.cfg').read_text(), config)
+        self.assertFalse((fl4 / 'mk').exists())
+        self.assertFalse((fl4 / 'mk').exists())
         src = config.index('source "$l4h/l4h.conf"')
         self.assertLess(config.index('l4h_selected="$l4h"'), src)
         self.assertIn('l4h="$l4h_selected"', config[src:src + 100])

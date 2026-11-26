@@ -20,8 +20,8 @@ Usage: curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/insta
   --uplink-bond IFNAME    Preserve an existing 802.3ad bond with two ConnectX-5 members
   --memory MiB            dom0 RAM (default: half of usable RAM, clamped to 512..8192 MiB)
   --vcpus N               dom0 CPUs (default: up to 4)
-  --variant NAME          fl4 (UEFI default), or the seL4 generic, xapic-nopcid or
-                          skim-xapic-nopcid (BIOS and --partitions; otherwise auto-select)
+  --variant NAME          fl4 (default), or the seL4 generic, xapic-nopcid or
+                          skim-xapic-nopcid (--partitions selects one of these)
   --assume-stable-tsc      Allow missing constant_tsc for experimental installs;
                           assume the TSC is stable without verifying it
   --partitions N          Split the machine into N l4h partitions (2-8, fresh installs;

@@ -645,14 +645,15 @@ remain locked. LACP frames pass only between each physical member and its
 dom0 interface. Ordinary guests cannot send or receive these frames.
 ConnectX-5 link changes update dom0's virtio carrier, speed and duplex.
 
-On UEFI the installer chooses \texttt{fl4}, the FL4 application
-(Section~\ref{sec:esp}), which detects CPU features and Meltdown at boot.
-BIOS machines and \texttt{--partitions} use seL4, since FL4 has neither a
-BIOS release nor multikernel support. For seL4 the installer chooses
+The installer chooses \texttt{fl4}: the FL4 application on UEFI
+(Section~\ref{sec:esp}) or FL4's kernel and root task on BIOS
+(Section~\ref{sec:bios}). FL4 detects CPU features and Meltdown at boot.
+\texttt{--partitions} uses seL4, since FL4 has no multikernel support.
+For seL4 the installer chooses
 \texttt{skim-xapic-nopcid} when Meltdown isolation is needed. Otherwise
 it chooses generic when PCID, INVPCID and x2APIC are available, or
-xapic-nopcid. \texttt{--variant NAME} overrides this choice, also on
-UEFI, subject to the same CPU checks. CPU capabilities cannot prove the
+xapic-nopcid. \texttt{--variant NAME} overrides this choice, also
+without \texttt{--partitions}, subject to the same CPU checks. CPU capabilities cannot prove the
 firmware's APIC state at the next boot: test the selected variant before making it permanent.
 Likewise, applications depending on native devices or kernel features,
 and network profiles matching a PCI path or native driver rather than
@@ -744,7 +745,8 @@ instead of NVRAM; it needs:
         \file{custom.cfg} that the installer did not write.
 \end{itemize}
 It downloads \file{l4h-bios-x86\_64.tar.xz} and writes the selected
-variant's kernel and the rest of the BIOS files to \file{/boot/l4h/bios},
+variant's kernel, its root task and the rest of the BIOS files to
+\file{/boot/l4h/bios},
 dom0's initramfs and settings to \file{/boot/l4h/dom0/initrd} and
 \file{/boot/l4h/l4h.conf}, then an \texttt{L4H} menu entry
 (\texttt{--id l4h}) in \file{custom.cfg} next to \file{grub.cfg}. It does
@@ -865,9 +867,10 @@ Each tagged release on GitHub carries, for x86\_64:
 \begin{itemize}
   \item all four applications, built in release mode, with their guest kernel
         and its build SDK in them;
-  \item \file{l4h-bios-x86\_64.tar.xz}: the seL4 variants for BIOS machines
+  \item \file{l4h-bios-x86\_64.tar.xz}: every variant for BIOS machines
         (Section~\ref{sec:bios}), with each variant's kernel as
-        \file{kernel-VARIANT.elf};
+        \file{kernel-VARIANT.elf}, the seL4 variants' root task
+        \file{l4h-root.elf} and FL4's \file{l4h-root-fl4.elf};
   \item \file{l4h-dom0-x86\_64.tar.xz}: a static \cmd{l4hctl} and an
         example \file{l4h.conf}. Add an initramfs or a root filesystem of
         your choice, with \cmd{l4hctl} in it (Sections on busybox and Debian
@@ -903,7 +906,8 @@ disk order, and its vNICs as \texttt{eth0}, \texttt{eth1}, \ldots
 BIOS GRUB cannot carry l4h in its core image, which must fit in a few
 hundred KiB, so on BIOS l4h's files live on a filesystem GRUB reads.
 \cmd{tools/mkbios.sh OUTDIR [l4h-root.elf] [kernel.elf]} builds them:
-\file{kernel.elf} (seL4), \file{l4h-root.elf}, \file{vmlinux},
+\file{kernel.elf} (seL4, or FL4 with \texttt{L4H\_KERNEL\_VARIANT=fl4}
+and a root task built against FL4), \file{l4h-root.elf}, \file{vmlinux},
 \file{sdk.erofs} and \file{grub.cfg}, the GRUB script that boots them
 with multiboot2. They go in \file{bios/} of one directory, which holds
 dom0's files too:
@@ -924,6 +928,8 @@ its recovery console).
 \begin{caveat}
 BIOS GRUB has no TPM support, so nothing measures l4h or dom0's files:
 attestation reports from a BIOS host do not show what it booted.
+FL4 cannot run as an SEV-SNP or TDX guest from BIOS GRUB, and writes its
+own output to COM1 whatever \texttt{serial\_port} says.
 \texttt{L4H\_ACPI\_TABLES} does not apply either.
 \end{caveat}
 
