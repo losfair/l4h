@@ -530,6 +530,19 @@ fn control_zero_uses_the_devices_write_zeroes_up_to_its_limit() {
 }
 
 #[test]
+fn write_zeroes_asks_at_most_16_mib_whole_4k_blocks_at_once() {
+    // A device that takes 1 GiB, or 7 sectors more than 2 MiB, at once: 16
+    // MiB, or 2 MiB, per request, so each answers within the slice and is a
+    // 4 KiB multiple dom0 goes on from.
+    let (answers, io) = run_zero(&[zero(65536, 20 * MIB_SECTORS)], |k| k.zeroes = (1 << 30) / 512);
+    assert_eq!(answers, [Ok((OK, 20 * MIB_SECTORS))]);
+    assert_eq!(io, [(WRITE_ZEROES, 65536, 16 << 20), (WRITE_ZEROES, 65536 + 16 * MIB_SECTORS, 4 << 20)]);
+    let (answers, io) = run_zero(&[zero(16384, 3 * MIB_SECTORS)], |k| k.zeroes = 2 * MIB_SECTORS as u32 + 7);
+    assert_eq!(answers, [Ok((OK, 3 * MIB_SECTORS))]);
+    assert_eq!(io, [(WRITE_ZEROES, 16384, 2 << 20), (WRITE_ZEROES, 16384 + 2 * MIB_SECTORS, 1 << 20)]);
+}
+
+#[test]
 fn a_failed_write_zeroes_is_written_over_and_never_used_again() {
     // The device says it zeroes and fails: that range, and every later
     // one, has zeros written instead; the answer is success.

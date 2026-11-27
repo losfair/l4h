@@ -1603,7 +1603,7 @@ fn zero_in_steps(sector: u64, sectors: u64, mut call: impl FnMut(u64, u64) -> Re
     let mut max = CTL_ZERO_MAX;
     let mut offset = 0;
     while offset < sectors {
-        let bytes = ((sectors - offset) * 512).min(max);
+        let bytes = (sectors - offset).min(max / 512) * 512;
         let (status, vals) = call(sector + offset, bytes)?;
         // A host before CTL_ZERO_MAX: CTL_LOAD_MAX at a time.
         if status == -22 && bytes > CTL_LOAD_MAX as u64 && max != CTL_LOAD_MAX as u64 {
@@ -1619,11 +1619,12 @@ fn zero_in_steps(sector: u64, sectors: u64, mut call: impl FnMut(u64, u64) -> Re
 }
 
 /// The bytes a zeroing BLK_WRITE of `asked` bytes zeroed: vals[0], a 4 KiB
-/// multiple from its start (0 from a host before CTL_ZERO_MAX: all of it).
+/// multiple from its start (0 from a host before CTL_ZERO_MAX, which zeroes
+/// CTL_LOAD_MAX at most: all of it).
 fn zeroed(vals: [u64; 6], asked: u64) -> Result<u64> {
     match vals[0] {
-        0 => Ok(asked),
-        n if n <= asked && n % 4096 == 0 => Ok(n),
+        0 if asked <= CTL_LOAD_MAX as u64 => Ok(asked),
+        n if n != 0 && n <= asked && n % 4096 == 0 => Ok(n),
         n => err(format!("the host zeroed {n} bytes of {asked}")),
     }
 }
@@ -1683,6 +1684,13 @@ mod discard_tests {
             let r = zero_in_steps(8, 8192, |_, _| Ok((0, [bad, 0, 0, 0, 0, 0])));
             assert!(r.is_err(), "{bad}");
         }
+        // 0 (all of it, from a host before CTL_ZERO_MAX) only answers what such a host takes.
+        assert!(zero_in_steps(8, 8192, |_, _| Ok((0, [0; 6]))).is_err());
+        // A range near u64::MAX bytes: asked CTL_ZERO_MAX at a time, not a wrapped size.
+        let mut first = None;
+        let r = zero_in_steps(0, 1 << 55, |at, bytes| { first.get_or_insert((at, bytes)); err("stop") });
+        assert!(r.is_err());
+        assert_eq!(first, Some((0, G)));
         // Any other refusal is the caller's.
         assert!(zero_in_steps(8, 8192, |_, _| Ok((-16, [0; 6]))).is_err());
     }

@@ -116,6 +116,11 @@ pub const ZERO_MAX_SECTORS: u64 = (1 << 30) / 512;
 /// About how long one `Zero` request keeps the device before it answers
 /// with what it has zeroed: dom0's control calls go one at a time.
 pub const ZERO_SLICE_MS: u64 = 100;
+/// The most blkd asks a device to zero by itself at once: a device that
+/// zeroes slowly (one that writes the zeros, or is throttled) still answers
+/// within the slice, and completes something well before blkd would give
+/// it up.
+pub const ZERO_REQUEST_SECTORS: u64 = (16 << 20) / 512;
 use crate::badges::driver as recv;
 use crate::errno::{EBUSY, EINVAL, ENOSPC, Errno};
 

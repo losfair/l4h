@@ -148,8 +148,9 @@ enum Provision {
     /// A write of staging, or a flush.
     Write,
     Discard,
-    /// Zeros, from staging filled with them or by the device's own command.
-    Zero,
+    /// Zeros, from staging filled with them or by the device's own
+    /// command, of the sectors asked.
+    Zero(u64),
 }
 
 const _: () = assert!(abi::CTL_ZERO_MAX == blk::ZERO_MAX_SECTORS * 512);
@@ -980,8 +981,9 @@ pub fn zero(h: &mut Host, disk: usize, sector: u64, sectors: u64, token: usize) 
     let ctrl = &mut h.ctrls[c];
     if ctrl.failed { return Err(ctl::EIO); }
     if ctrl.staging_busy || !ctrl.room() { return Err(ctl::EBUSY); }
-    ctrl.stage(None, blk::STAGING_SIZE, &mut h.wins.a);
-    ctrl.post(Request::Zero { sector, sectors, unit: unit as usize }, BlkOp::Provision { token, kind: Provision::Zero })
+    // blkd writes no more than the range from it.
+    ctrl.stage(None, blk::STAGING_SIZE.min(sectors.saturating_mul(512) as usize), &mut h.wins.a);
+    ctrl.post(Request::Zero { sector, sectors, unit: unit as usize }, BlkOp::Provision { token, kind: Provision::Zero(sectors) })
         .map_err(|_| ctl::EBUSY)?;
     ctrl.staging_busy = true;
     Ok(())
@@ -1062,17 +1064,20 @@ fn complete(h: &mut Host, c: usize, op: BlkOp, w: host::mailbox::Reply) {
                     ctrl.staging_busy = false;
                     wire::reply::<reply::Write>(&w)
                 }
-                Provision::Zero => {
+                Provision::Zero(asked) => {
                     ctrl.staging_busy = false;
                     wire::reply::<reply::Zero>(&w).map(|(status, sectors)| {
                         zeroed = sectors.saturating_mul(512);
-                        // Success zeroes something: none would have dom0 ask forever.
-                        if status == 0 && sectors == 0 { blk::STATUS_IOERR as u64 } else { status }
+                        // Success zeroes a 4 KiB prefix of the range, not
+                        // none: dom0 would ask forever.
+                        if status == 0 && (sectors == 0 || sectors > asked || sectors % 8 != 0) {
+                            blk::STATUS_IOERR as u64
+                        } else { status }
                     })
                 }
             };
             let r = match status {
-                Ok(0) if kind == Provision::Zero => Ok(OpResult::Vals([zeroed].into_iter().collect())),
+                Ok(0) if matches!(kind, Provision::Zero(_)) => Ok(OpResult::Vals([zeroed].into_iter().collect())),
                 Ok(0) => Ok(OpResult::Vals(Default::default())),
                 Ok(s) if kind == Provision::Discard && s == blk::STATUS_UNSUPP as u64 => Ok(OpResult::Vals(Default::default())),
                 // The device failed, or blkd did.

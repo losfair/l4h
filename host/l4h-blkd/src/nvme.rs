@@ -533,7 +533,7 @@ impl Driver for Nvme {
     }
 
     fn write_zeroes_max(&self, unit: usize) -> u32 {
-        let ns = self.namespaces[unit];
+        let Some(&ns) = self.namespaces.get(unit) else { return 0 };
         if self.write_zeroes_bytes == 0 || !ns.write_zeroes { return 0; }
         let per_cmd = (self.write_zeroes_bytes >> ns.lba_shift).clamp(1, WZ_MAX_BLOCKS);
         let cmds = WZ_MAX_CMDS.min(self.max_cmds as u64).max(1);

@@ -83,7 +83,8 @@ pub trait Driver {
         Err(blk::STATUS_UNSUPP)
     }
     /// Maximum 512-byte sectors one write-zeroes request covers, a
-    /// multiple of the block size.  Zero: the device has no command that
+    /// multiple of the block size (blkd uses a 4 KiB multiple of it, at
+    /// most blk::ZERO_REQUEST_SECTORS).  Zero: the device has no command that
     /// zeroes without data, and blkd writes zeros instead.  A range a
     /// write-zeroes completed without error reads zero.
     fn write_zeroes_max(&self, _unit: usize) -> u32 { 0 }
@@ -528,7 +529,10 @@ impl Blkd {
         let mut done = 0;
         while done < sectors {
             let (at, left) = (sector + done, sectors - done);
-            let max = if self.no_write_zeroes[unit] { 0 } else { u64::from(self.drv.write_zeroes_max(unit)) };
+            // 4 KiB multiples: what a request zeroed is where dom0 goes on.
+            let max = if self.no_write_zeroes[unit] { 0 } else {
+                u64::from(self.drv.write_zeroes_max(unit)).min(blk::ZERO_REQUEST_SECTORS) & !7
+            };
             let (count, status) = if max != 0 {
                 let count = left.min(max);
                 let status = self.provision_io(|drv| drv.start_write_zeroes(u64::MAX, unit, at, count as u32));
