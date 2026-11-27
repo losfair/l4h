@@ -299,14 +299,29 @@ fn open_tpm(cfg: &TrustdConfig, hz: u64) -> Result<Tpm, (&'static str, Error)> {
     Ok(tpm)
 }
 
-/// The TPM and a key from its randomness (not a TD's: a TD's key is the
-/// CPU's, made and bound to RTMR 3 before the TPM is touched).
+/// The TPM and a key from its randomness mixed with the CPU's
+/// (key::mix_key_seed; the TPM's alone without RDSEED or RDRAND), so that
+/// neither a TPM's known answers nor its bus give the key away.  Not a
+/// TD's: a TD's key is the CPU's, made and bound to RTMR 3 before the TPM
+/// is touched.
 fn tpm_key(cfg: &TrustdConfig, hz: u64) -> Result<(Tpm, SigningKey), (&'static str, Error)> {
     let mut tpm = open_tpm(cfg, hz)?;
     let key = loop {
-        let mut seed = [0u8; 32];
-        step("GetRandom", tpm2::get_random(&mut tpm, &mut seed))?;
-        if let Ok(k) = SigningKey::from_bytes(&seed.into()) {
+        let mut tpm_rand = [0u8; 32];
+        let got = tpm2::get_random(&mut tpm, &mut tpm_rand);
+        if got.is_err() {
+            key::wipe(&mut tpm_rand);
+        }
+        step("GetRandom", got)?;
+        let mut cpu = cpu_seed();
+        let mut seed = key::mix_key_seed(&tpm_rand, cpu.as_ref());
+        let k = SigningKey::from_bytes((&seed).into());
+        key::wipe(&mut tpm_rand);
+        if let Some(c) = cpu.as_mut() {
+            key::wipe(c);
+        }
+        key::wipe(&mut seed);
+        if let Ok(k) = k {
             break k;
         }
     };
@@ -410,9 +425,9 @@ fn cpu_random(_out: &mut [u8; 32]) -> bool {
     false
 }
 
-/// 32 bytes of the CPU's entropy for a TD's key: RDSEED where it has it
-/// (straight from the entropy source), else RDRAND.  In a TD neither
-/// exits to the VMM.
+/// 32 bytes of the CPU's entropy for a TD's key, and mixed into a TPM
+/// host's (tpm_key): RDSEED where it has it (straight from the entropy
+/// source), else RDRAND.  In a TD neither exits to the VMM.
 #[cfg(target_arch = "x86_64")]
 fn cpu_seed() -> Option<[u8; 32]> {
     #[allow(unused_unsafe)]

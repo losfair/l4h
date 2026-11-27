@@ -4716,7 +4716,13 @@ The chain has four links.
    take a core from
    guests; the flags server takes at most a tenth of that core besides. At
    start, trustd:
-   - generates a P-256 key K in software, from TPM randomness;
+   - generates a P-256 key K in software from 32 bytes of TPM2_GetRandom
+     mixed with 32 of the CPU's (RDSEED, else RDRAND):
+     `SHA-256("l4h-trustd-rng-v1" ‖ tpm ‖ cpu)` (`key::mix_key_seed`), so
+     that K stays unpredictable while either source is (a TPM whose
+     answers are known, or a discrete TPM's bus read or tampered with);
+     the TPM's alone on a CPU with neither. The inputs and seed are wiped
+     (volatile stores) once K is made;
    - creates the attestation key (AK), a restricted ECDSA P-256 signing
      primary key of the endorsement hierarchy, so the same template gives
      the same key every boot. It has an empty password and `noDA`: trustd
