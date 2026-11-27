@@ -39,9 +39,18 @@ const PRP_BYTES: usize = 1 << 20;
 const OP_FLUSH: u8 = 0x00;
 const OP_WRITE: u8 = 0x01;
 const OP_READ: u8 = 0x02;
+const OP_WRITE_ZEROES: u8 = 0x08;
 const OP_DATASET_MANAGEMENT: u8 = 0x09;
 const DSM_DEALLOCATE: u32 = 1 << 2;
 const ONCS_DSM: u16 = 1 << 2;
+const ONCS_WRITE_ZEROES: u16 = 1 << 3;
+/// Write Zeroes CDW12: deallocate the blocks (they read zero all the same).
+const WZ_DEAC: u32 = 1 << 25;
+/// A Write Zeroes covers at most 2^16 blocks (NLB is 16 bits).
+const WZ_MAX_BLOCKS: u64 = 1 << 16;
+/// Write Zeroes commands one request may take: a request is started only
+/// with a command id for each (can_start keeps max_cmds free).
+const WZ_MAX_CMDS: u64 = 64;
 const ADMIN_CREATE_SQ: u8 = 0x01;
 const ADMIN_CREATE_CQ: u8 = 0x05;
 const ADMIN_IDENTIFY: u8 = 0x06;
@@ -49,6 +58,8 @@ const ADMIN_SET_FEATURES: u8 = 0x09;
 const IDENTIFY_NAMESPACE: u32 = 0;
 const IDENTIFY_CONTROLLER: u32 = 1;
 const IDENTIFY_ACTIVE_NAMESPACES: u32 = 2;
+/// The I/O command set specific controller data (NVMe 2.0), for CSI 0 (NVM).
+const IDENTIFY_CONTROLLER_NVM: u32 = 6;
 
 struct Sq {
     va: usize,
@@ -134,6 +145,12 @@ struct Namespace {
     id: u32,
     lba_shift: u32,
     blocks: u64,
+    /// Write Zeroes may deallocate: the namespace says deallocated blocks
+    /// read zero and Write Zeroes may deallocate them (DLFEAT).
+    deac: bool,
+    /// Write Zeroes is used: no end-to-end protection information, whose
+    /// fields it would have to set.
+    write_zeroes: bool,
 }
 
 pub struct Nvme {
@@ -161,6 +178,9 @@ pub struct Nvme {
     max_cmds: usize,
     flush: bool,
     discard: bool,
+    /// The most bytes one Write Zeroes may cover (0: the controller has
+    /// none).
+    write_zeroes_bytes: u64,
 }
 
 fn spin_until(what: &str, mut f: impl FnMut() -> bool) {
@@ -237,6 +257,7 @@ impl Nvme {
             max_cmds: 0,
             flush: false,
             discard: false,
+            write_zeroes_bytes: 0,
         };
 
         // Identify controller: transfer limit, volatile write cache.
@@ -244,12 +265,30 @@ impl Nvme {
         let id_ctrl = Mmio(n.ident.0);
         let mdts = id_ctrl.r8(77);
         // MDTS (the device's) in units of 2^(12 + CAP.MPSMIN): from 2^64 on, no limit.
-        let mdts_shift = 12 + ((cap >> 48) & 0xf) as u32 + mdts as u32;
+        let mps_shift = 12 + ((cap >> 48) & 0xf) as u32;
+        let mdts_shift = mps_shift + mdts as u32;
         if mdts != 0 && mdts_shift < 64 {
             n.max_bytes = n.max_bytes.min(1 << mdts_shift);
         }
         n.flush = id_ctrl.r8(525) & 1 != 0;
         n.discard = id_ctrl.r16(520) & ONCS_DSM != 0;
+        let write_zeroes = id_ctrl.r16(520) & ONCS_WRITE_ZEROES != 0;
+        let (version, max_nsid) = (regs.r32(REG_VS), id_ctrl.r32(516));
+        if write_zeroes {
+            // As Linux: Write Zeroes within MDTS, unless the controller
+            // states its own limit (WZSL, in the same units).
+            let mut shift = if mdts != 0 && mdts_shift < 64 { Some(mdts_shift) } else { None };
+            if version >= 0x0002_0000 {
+                let status = n.admin_status(Cmd {
+                    opcode: ADMIN_IDENTIFY, prp1: n.ident.1, cdw10: IDENTIFY_CONTROLLER_NVM, ..Default::default()
+                });
+                let wzsl = Mmio(n.ident.0).r8(1);
+                if status == 0 && wzsl != 0 && mps_shift + (wzsl as u32) < 64 {
+                    shift = Some(mps_shift + wzsl as u32);
+                }
+            }
+            n.write_zeroes_bytes = shift.map_or(u64::MAX, |s| 1 << s);
+        }
         // A command that starts mid-page spans one page more than it fills
         // (max_bytes is whole pages, at least two).
         let entries = (n.max_bytes / PAGE) as usize;
@@ -267,7 +306,7 @@ impl Nvme {
         if need > cids {
             l4h_rt::log!("nvme {:#x}: {} command ids for up to {} per request: large requests may fail", id, cids, need);
         }
-        n.discover_namespaces(regs.r32(REG_VS), id_ctrl.r32(516));
+        n.discover_namespaces(version, max_nsid);
         // One I/O queue pair on interrupt vector 0.
         n.admin(Cmd { opcode: ADMIN_SET_FEATURES, cdw10: 7, cdw11: 0, ..Default::default() });
         n.admin(Cmd {
@@ -313,7 +352,12 @@ impl Nvme {
                 l4h_rt::log!("nvme {:#x}: namespace {} has unsupported LBA size 2^{}", self.id, id, lba_shift);
                 continue;
             }
-            let _ = self.namespaces.push(Namespace { id, lba_shift, blocks });
+            // DLFEAT: bits 2:0 001b, deallocated blocks read zero; bit 3,
+            // Write Zeroes may deallocate.  DPS: protection information.
+            let dlfeat = data.r8(33);
+            let deac = dlfeat & 0x7 == 1 && dlfeat & (1 << 3) != 0;
+            let write_zeroes = data.r8(29) & 0x7 == 0;
+            let _ = self.namespaces.push(Namespace { id, lba_shift, blocks, deac, write_zeroes });
         }
         l4h_rt::info!("nvme {:#x}: version {:#x}, {} namespaces found", self.id, version, self.namespaces.len());
     }
@@ -485,6 +529,50 @@ impl Driver for Nvme {
             cdw11: DSM_DEALLOCATE,
             ..Default::default()
         });
+        Ok(())
+    }
+
+    fn write_zeroes_max(&self, unit: usize) -> u32 {
+        let Some(&ns) = self.namespaces.get(unit) else { return 0 };
+        if self.write_zeroes_bytes == 0 || !ns.write_zeroes { return 0; }
+        let per_cmd = (self.write_zeroes_bytes >> ns.lba_shift).clamp(1, WZ_MAX_BLOCKS);
+        let cmds = WZ_MAX_CMDS.min(self.max_cmds as u64).max(1);
+        let blocks = (per_cmd * cmds).min(u64::from(u32::MAX) >> (ns.lba_shift - 9));
+        (blocks << (ns.lba_shift - 9)) as u32
+    }
+
+    fn start_write_zeroes(&mut self, tag: u64, unit: usize, sector: u64, sectors: u32) -> Result<(), u32> {
+        let max = self.write_zeroes_max(unit);
+        if max == 0 { return Err(blk::STATUS_UNSUPP); }
+        let ns = *self.namespaces.get(unit).ok_or(blk::STATUS_IOERR)?;
+        let shift = ns.lba_shift - 9;
+        let align = (1u64 << shift) - 1;
+        if sectors == 0 || sectors > max || u64::from(sectors) & align != 0 || sector & align != 0 {
+            return Err(blk::STATUS_IOERR);
+        }
+        let (lba, blocks) = (sector >> shift, u64::from(sectors) >> shift);
+        let per_cmd = (self.write_zeroes_bytes >> ns.lba_shift).clamp(1, WZ_MAX_BLOCKS);
+        // All of the request's commands are issued, or none.
+        let cmds = blocks.div_ceil(per_cmd) as usize;
+        if cmds > self.free_cids.len() { return Err(blk::STATUS_IOERR); }
+        let req = self.free_reqs.pop().ok_or(blk::STATUS_IOERR)?;
+        self.reqs[req as usize] = Request { tag, pending: 0, status: blk::STATUS_OK };
+        let deac = if ns.deac { WZ_DEAC } else { 0 };
+        let mut at = 0;
+        while at < blocks {
+            let n = (blocks - at).min(per_cmd);
+            let cid = self.free_cids.pop().unwrap();
+            self.submit_io(req, Cmd {
+                opcode: OP_WRITE_ZEROES,
+                cid,
+                nsid: ns.id,
+                cdw10: (lba + at) as u32,
+                cdw11: ((lba + at) >> 32) as u32,
+                cdw12: deac | (n - 1) as u32,
+                ..Default::default()
+            });
+            at += n;
+        }
         Ok(())
     }
 

@@ -44,6 +44,13 @@ case " $(cat /proc/cmdline) " in
     echo "GUEST: stale bytes $n"
     echo "GUEST: dma check done"
     while :; do sleep 10; done ;;
+*" l4htest=zerocheck "*)
+    # The bytes of the disk (a window init-ctltest zeroed, with pattern
+    # around it) that are not zero.
+    n=$(/bin/nonzero /dev/vda) || n=unreadable
+    echo "GUEST: nonzero bytes $n of $(($(cat /sys/block/vda/size) * 512))"
+    echo "GUEST: zero check done"
+    while :; do sleep 10; done ;;
 esac
 if [ -b /dev/vda ]; then
     echo "GUEST: vda size $(cat /sys/block/vda/size) ro $(cat /sys/block/vda/ro) cache $(cat /sys/block/vda/queue/write_cache)"

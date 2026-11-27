@@ -82,6 +82,15 @@ pub trait Driver {
     fn start_discard(&mut self, _tag: u64, _unit: usize, _sector: u64, _sectors: u32) -> Result<(), u32> {
         Err(blk::STATUS_UNSUPP)
     }
+    /// Maximum 512-byte sectors one write-zeroes request covers, a
+    /// multiple of the block size (blkd uses a 4 KiB multiple of it, at
+    /// most blk::ZERO_REQUEST_SECTORS).  Zero: the device has no command that
+    /// zeroes without data, and blkd writes zeros instead.  A range a
+    /// write-zeroes completed without error reads zero.
+    fn write_zeroes_max(&self, _unit: usize) -> u32 { 0 }
+    fn start_write_zeroes(&mut self, _tag: u64, _unit: usize, _sector: u64, _sectors: u32) -> Result<(), u32> {
+        Err(blk::STATUS_UNSUPP)
+    }
     /// Tell the device about started requests.
     fn kick(&mut self);
     /// Report completed requests.
@@ -224,6 +233,8 @@ struct Blkd {
     /// The clients `remove` is draining, by slot: `submit` takes nothing
     /// more from their channels.
     drains: [Option<Drain>; blk::MAX_CLIENTS],
+    /// Units whose write-zeroes failed once: zeroed by writing zeros since.
+    no_write_zeroes: [bool; blk::MAX_UNITS],
 }
 
 /// A client's drain (`Blkd::remove`), which root asks for again until it
@@ -501,6 +512,51 @@ impl Blkd {
         Ok(blk::STATUS_OK as u64)
     }
 
+    /// Zero a prefix of `sector`, `sectors` (blk::call::Zero): (a
+    /// blk::STATUS_*, u64::MAX if the device failed; the sectors zeroed),
+    /// or the errno the range is refused with.  Staging holds zeros (root
+    /// filled it for this request).
+    fn zero(&mut self, cfg: &BlkdConfig, unit: usize, sector: u64, sectors: u64) -> Result<(u64, u64), Errno> {
+        let Some(&dev) = self.dev.get(unit) else { return Ok((u64::MAX, 0)) };
+        if sectors == 0 || sectors > blk::ZERO_MAX_SECTORS || sector % 8 != 0 || sectors % 8 != 0 {
+            return Err(errno::EINVAL);
+        }
+        // Check the whole range before the device can zero any of it.
+        self.provision_window(unit, sector, sectors, dev.capacity)?;
+        if dev.read_only { return Err(errno::EPERM); }
+        let end = host::ticks::now().saturating_add(self.ticks_per_sec.saturating_mul(blk::ZERO_SLICE_MS) / 1000);
+        let staging = cfg.dma_paddr + cfg.dma_size;
+        let mut done = 0;
+        while done < sectors {
+            let (at, left) = (sector + done, sectors - done);
+            // 4 KiB multiples: what a request zeroed is where dom0 goes on.
+            let max = if self.no_write_zeroes[unit] { 0 } else {
+                u64::from(self.drv.write_zeroes_max(unit)).min(blk::ZERO_REQUEST_SECTORS) & !7
+            };
+            let (count, status) = if max != 0 {
+                let count = left.min(max);
+                let status = self.provision_io(|drv| drv.start_write_zeroes(u64::MAX, unit, at, count as u32));
+                if status != blk::STATUS_OK as u64 && status != u64::MAX {
+                    // The device would not (it may say it can and refuse the
+                    // command): zeros are written instead, from now on.
+                    l4h_rt::info!("blkd: unit {}: write zeroes failed (status {}): writing zeros instead", unit, status);
+                    self.no_write_zeroes[unit] = true;
+                    continue;
+                }
+                (count, status)
+            } else {
+                let count = left.min((blk::STAGING_SIZE / 512) as u64);
+                let data = [Seg { pa: staging, len: (count * 512) as u32 }];
+                (count, self.provision_io(|drv| drv.start(u64::MAX, unit, blk::OP_WRITE, at, &data)))
+            };
+            if status != blk::STATUS_OK as u64 { return Ok((status, done)); }
+            done += count;
+            self.submit();
+            if host::ticks::now() > end { break; }
+        }
+        Ok((blk::STATUS_OK as u64, done))
+    }
+
     fn provision_io(&mut self, start: impl FnOnce(&mut dyn Driver) -> Result<(), u32>) -> u64 {
         // The device is given up only when it completes nothing for the
         // bound. No new client requests are started while this waits.
@@ -629,6 +685,10 @@ impl blk::call::Server for Requests<'_> {
         self.b.discard(unit, sector, sectors)
     }
 
+    fn zero(&mut self, _: blk::Sender, sector: u64, sectors: u64, unit: usize) -> Result<(u64, u64), Errno> {
+        self.b.zero(self.cfg, unit, sector, sectors)
+    }
+
     fn reserve(&mut self, _: blk::Sender, unit: usize, start: u64, sectors: u64, read_only: bool) -> Result<usize, Errno> {
         // Boot ranges may lie beyond an unknown or unaligned capacity:
         // they keep sectors from others, never address them.
@@ -690,7 +750,7 @@ fn main(info: &'static Info) -> ! {
         pending: [None; MAX_INFLIGHT],
         carry: None,
         drv, dev, next: 0, ticks_per_sec: info.header().tsc_hz,
-        seq: 0, reaped: 0, drains: [None; blk::MAX_CLIENTS],
+        seq: 0, reaped: 0, drains: [None; blk::MAX_CLIENTS], no_write_zeroes: [false; blk::MAX_UNITS],
     };
     // The only references to the scratch table.
     let scratch_order = unsafe { &mut *addr_of_mut!(SCRATCH_ORDER) };

@@ -12,6 +12,8 @@ use std::os::fd::AsRawFd;
 pub const CTL_VERSION: u32 = 3;
 pub const CTL_DATA_MAX: usize = 1984;
 pub const CTL_LOAD_MAX: usize = 1 << 20;
+/// The most bytes one zeroing BLK_WRITE asks for (hosts before it: CTL_LOAD_MAX).
+pub const CTL_ZERO_MAX: u64 = 1 << 30;
 pub const CTL_NAME_MAX: usize = 32;
 
 pub const CTL_HOST_INFO: u32 = 1;
@@ -1575,23 +1577,55 @@ impl Ctl {
         Ok(())
     }
 
-    /// Explicit zero writes, including sparse image holes and recycled space.
+    /// Explicit zeros, including sparse image holes and recycled space: the
+    /// range reads zero after (the device's Write Zeroes where the host has
+    /// it, written zeros otherwise; never a discard).
     pub fn disk_zero(&self, disk: u64, sector: u64, sectors: u64) -> Result<()> {
         if sector % 8 != 0 || sectors == 0 || sectors % 8 != 0 || sector.checked_add(sectors).is_none() {
             return err("disk zero must be a finite 4 KiB aligned range");
         }
-        let mut offset = 0;
-        while offset < sectors {
-            let count = (sectors - offset).min((CTL_LOAD_MAX / 512) as u64);
-            self.call(CTL_BLK_WRITE, &[disk, sector + offset, count * 512, 1], &[], &[])?;
-            offset += count;
-        }
-        Ok(())
+        zero_in_steps(sector, sectors, |at, bytes| {
+            let resp = self.raw_call(CTL_BLK_WRITE, &[disk, at, bytes, 1], &[], 0, 0)?;
+            Ok((resp.status, resp.vals))
+        })
     }
 
     pub fn disk_flush(&self, disk: u64) -> Result<()> {
         self.call(CTL_BLK_WRITE, &[disk, 0, 0, 0], &[], &[])?;
         Ok(())
+    }
+}
+
+/// Zero `sector`, `sectors` by zeroing BLK_WRITEs, `call(at, bytes)` (its
+/// status and vals): CTL_ZERO_MAX at most each, each answering what it
+/// zeroed; CTL_LOAD_MAX at a time on a host that refuses more.
+fn zero_in_steps(sector: u64, sectors: u64, mut call: impl FnMut(u64, u64) -> Result<(i64, [u64; 6])>) -> Result<()> {
+    let mut max = CTL_ZERO_MAX;
+    let mut offset = 0;
+    while offset < sectors {
+        let bytes = (sectors - offset).min(max / 512) * 512;
+        let (status, vals) = call(sector + offset, bytes)?;
+        // A host before CTL_ZERO_MAX: CTL_LOAD_MAX at a time.
+        if status == -22 && bytes > CTL_LOAD_MAX as u64 && max != CTL_LOAD_MAX as u64 {
+            max = CTL_LOAD_MAX as u64;
+            continue;
+        }
+        if status < 0 {
+            return err(format!("request {CTL_BLK_WRITE} failed: {}", errno_name(-status)));
+        }
+        offset += zeroed(vals, bytes)? / 512;
+    }
+    Ok(())
+}
+
+/// The bytes a zeroing BLK_WRITE of `asked` bytes zeroed: vals[0], a 4 KiB
+/// multiple from its start (0 from a host before CTL_ZERO_MAX, which zeroes
+/// CTL_LOAD_MAX at most: all of it).
+fn zeroed(vals: [u64; 6], asked: u64) -> Result<u64> {
+    match vals[0] {
+        0 if asked <= CTL_LOAD_MAX as u64 => Ok(asked),
+        n if n != 0 && n <= asked && n % 4096 == 0 => Ok(n),
+        n => err(format!("the host zeroed {n} bytes of {asked}")),
     }
 }
 
@@ -1613,6 +1647,52 @@ mod discard_tests {
         for (sector, sectors) in [(0, 0), (1, 8), (0, 7), (u64::MAX - 7, 8)] {
             assert!(discard_args(6, sector, sectors).is_err());
         }
+    }
+
+    /// Runs zero_in_steps against a host that zeroes at most `per_call`
+    /// bytes a call (0: an old host, all of it, CTL_LOAD_MAX at most).
+    fn zero_calls(sectors: u64, per_call: u64) -> (Result<()>, Vec<(u64, u64)>) {
+        let mut calls = vec![];
+        let r = zero_in_steps(8, sectors, |at, bytes| {
+            calls.push((at, bytes));
+            Ok(match per_call {
+                0 if bytes > CTL_LOAD_MAX as u64 => (-22, [0; 6]),
+                0 => (0, [0; 6]),
+                n => (0, [n.min(bytes), 0, 0, 0, 0, 0]),
+            })
+        });
+        (r, calls)
+    }
+
+    #[test]
+    fn zeroing_goes_on_from_what_each_call_zeroed() {
+        const G: u64 = 1 << 30;
+        // A range larger than CTL_ZERO_MAX: one call per GiB, all done.
+        let (r, calls) = zero_calls(3 * G / 512, u64::MAX);
+        assert!(r.is_ok());
+        assert_eq!(calls, [(8, G), (8 + G / 512, G), (8 + 2 * G / 512, G)]);
+        // A host that stops short: asked again from where it stopped.
+        let (r, calls) = zero_calls(16 << 11, 4 << 20);
+        assert!(r.is_ok());
+        assert_eq!(calls, [(8, 16 << 20), (8 + (4 << 11), 12 << 20), (8 + (8 << 11), 8 << 20), (8 + (12 << 11), 4 << 20)]);
+        // A host before CTL_ZERO_MAX refuses more than CTL_LOAD_MAX once; then 1 MiB at a time.
+        let (r, calls) = zero_calls(3 << 11, 0);
+        assert!(r.is_ok());
+        assert_eq!(calls, [(8, 3 << 20), (8, 1 << 20), (8 + (1 << 11), 1 << 20), (8 + (2 << 11), 1 << 20)]);
+        // What a host claims beyond what was asked, or unaligned, is an error.
+        for bad in [(4 << 20) + 4096, 512] {
+            let r = zero_in_steps(8, 8192, |_, _| Ok((0, [bad, 0, 0, 0, 0, 0])));
+            assert!(r.is_err(), "{bad}");
+        }
+        // 0 (all of it, from a host before CTL_ZERO_MAX) only answers what such a host takes.
+        assert!(zero_in_steps(8, 8192, |_, _| Ok((0, [0; 6]))).is_err());
+        // A range near u64::MAX bytes: asked CTL_ZERO_MAX at a time, not a wrapped size.
+        let mut first = None;
+        let r = zero_in_steps(0, 1 << 55, |at, bytes| { first.get_or_insert((at, bytes)); err("stop") });
+        assert!(r.is_err());
+        assert_eq!(first, Some((0, G)));
+        // Any other refusal is the caller's.
+        assert!(zero_in_steps(8, 8192, |_, _| Ok((-16, [0; 6]))).is_err());
     }
 }
 

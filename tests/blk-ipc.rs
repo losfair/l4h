@@ -175,20 +175,33 @@ struct Kernel {
     log: Vec<(bool, u64)>,
     /// Data pieces of a request the mock device takes.
     seg_max: usize,
+    /// Root's provisioning I/O the device started: op (OP_WRITE, or
+    /// WRITE_ZEROES), sector, bytes.
+    provisioned: Vec<(u32, u64, u64)>,
+    /// The device's write_zeroes_max (0: it has none); whether its write
+    /// zeroes fail; the ticks a provisioning request takes.
+    zeroes: u32,
+    zeroes_fail: bool,
+    provision_ticks: u64,
 }
+/// `provisioned`'s op for a write zeroes.
+const WRITE_ZEROES: u32 = 99;
 thread_local! {
     static KERNEL: RefCell<Kernel> = RefCell::new(Kernel {
         ipc: sel4::IpcBuffer([0; 120]), requests: VecDeque::new(), replies: Vec::new(),
         retry: false, status: 0, kicks: 0, signals: 0, room: usize::MAX, started: Vec::new(),
         pace: 0, last: 0, stuck: false, publish: 0, shrink: None, log: Vec::new(), seg_max: production::MAX_PIECES,
+        provisioned: Vec::new(), zeroes: 0, zeroes_fail: false, provision_ticks: 0,
     });
 }
 
-pub struct MockDriver { legacy_io: u32, queue: u16, provisioning: bool, in_flight: Vec<u64> }
+pub struct MockDriver { legacy_io: u32, queue: u16, provisioning: bool, in_flight: Vec<u64>,
+    /// The provisioning request is a write zeroes; when it started.
+    zeroing: bool, provision_at: u64 }
 impl MockDriver {
     pub fn new(_: u32, cfg: &BlkdConfig) -> Self {
         let queue = if cfg.kind == blk::BLKD_VIRTIO_SCSI { 2 } else { 0 };
-        Self { legacy_io: cfg.legacy_io, queue, provisioning: false, in_flight: Vec::new() }
+        Self { legacy_io: cfg.legacy_io, queue, provisioning: false, in_flight: Vec::new(), zeroing: false, provision_at: 0 }
     }
     fn notify(&self) {
         KERNEL.with_borrow_mut(|k| {
@@ -208,8 +221,13 @@ impl Driver for MockDriver {
             seg_max: KERNEL.with_borrow(|k| k.seg_max) }
     }
     fn can_start(&self) -> bool { KERNEL.with_borrow(|k| self.in_flight.len() < k.room) }
-    fn start(&mut self, tag: u64, _: usize, _: u32, sector: u64, data: &[Seg]) -> Result<(), u32> {
-        self.provisioning |= tag == u64::MAX;
+    fn start(&mut self, tag: u64, _: usize, op: u32, sector: u64, data: &[Seg]) -> Result<(), u32> {
+        if tag == u64::MAX {
+            self.provisioning = true;
+            self.provision_at = host::ticks::now();
+            let bytes = data.iter().map(|s| s.len as u64).sum();
+            KERNEL.with_borrow_mut(|k| k.provisioned.push((op, sector, bytes)));
+        }
         if tag != u64::MAX {
             self.in_flight.push(tag);
             let bytes = data.iter().map(|s| s.len as u64).sum();
@@ -225,11 +243,21 @@ impl Driver for MockDriver {
         }
         self.start(tag, unit, blk::OP_DISCARD, sector, &[Seg { pa: 0, len: sectors * 512 }])
     }
+    fn write_zeroes_max(&self, _: usize) -> u32 { KERNEL.with_borrow(|k| k.zeroes) }
+    fn start_write_zeroes(&mut self, tag: u64, unit: usize, sector: u64, sectors: u32) -> Result<(), u32> {
+        assert!(tag == u64::MAX && sectors > 0 && sectors <= self.write_zeroes_max(unit));
+        (self.provisioning, self.zeroing, self.provision_at) = (true, true, host::ticks::now());
+        KERNEL.with_borrow_mut(|k| k.provisioned.push((WRITE_ZEROES, sector, u64::from(sectors) * 512)));
+        Ok(())
+    }
     fn kick(&mut self) { self.notify(); }
     fn reap(&mut self, done: &mut dyn FnMut(u64, u32)) {
-        if core::mem::take(&mut self.provisioning) {
-            let (status, retry) = KERNEL.with_borrow(|k| (k.status, k.retry));
-            done(u64::MAX, status);
+        let ticks = KERNEL.with_borrow(|k| k.provision_ticks);
+        if self.provisioning && host::ticks::now().wrapping_sub(self.provision_at) >= ticks {
+            self.provisioning = false;
+            let (status, retry, fail) = KERNEL.with_borrow(|k| (k.status, k.retry, k.zeroes_fail));
+            let zeroing = core::mem::take(&mut self.zeroing);
+            done(u64::MAX, if zeroing && fail { blk::STATUS_IOERR } else { status });
             // VirtioScsi::reap notifies after all callbacks when another
             // completion in the batch needs retrying (BUSY/UNIT_ATTENTION).
             if retry { self.notify(); }
@@ -368,6 +396,12 @@ fn refused_provisioning_reports_its_errno() {
 /// client publishes it, then the client is removed.  The replies, the
 /// pieces started, and the client's completion.
 fn run_split(op: u32, between: &[(u64, [u64; 6])]) -> (Vec<[u64; 5]>, Vec<(u64, u64, u64)>, (u32, u64, u32)) {
+    run_split_with(op, between, |_| {})
+}
+
+/// run_split with the mock device set up by `device` first.
+fn run_split_with(op: u32, between: &[(u64, [u64; 6])], device: impl FnOnce(&mut Kernel))
+    -> (Vec<[u64; 5]>, Vec<(u64, u64, u64)>, (u32, u64, u32)) {
     let _lock = lock();
     map_client();
     // Guest sectors 0..8192 are disk sectors 40960.., then 8192...
@@ -395,6 +429,9 @@ fn run_split(op: u32, between: &[(u64, [u64; 6])]) -> (Vec<[u64; 5]>, Vec<(u64, 
         k.replies.clear();
         (k.retry, k.status, k.kicks, k.room) = (false, 0, 0, 1);
         k.started.clear();
+        k.provisioned.clear();
+        (k.zeroes, k.zeroes_fail, k.provision_ticks) = (0, false, 0);
+        device(k);
     });
     let mut config: BlkdConfig = unsafe { core::mem::zeroed() };
     config.dma_va = staging.as_ptr() as u64;
@@ -439,6 +476,102 @@ fn control_discard_refuses_live_and_reserved_sectors_before_issuing_io() {
     assert_eq!(control, [(u64::MAX, 32, 8192), (u64::MAX, 48, 8192)]);
     assert_eq!(guest, [(0, 49144, 4096), (1, 8192, 4096)]);
     assert_eq!(done, (1, 7, blk::STATUS_OK));
+}
+
+fn zero(sector: u64, sectors: u64) -> (u64, [u64; 6]) { post(Request::Zero { unit: 0, sector, sectors }) }
+
+/// Zero requests after the split request's extents attach (40960..49152
+/// and 8192..16384) and a boot reservation of 64..72: their answers and
+/// root's provisioning I/O.
+fn run_zero(requests: &[(u64, [u64; 6])], device: impl FnOnce(&mut Kernel))
+    -> (Vec<Result<(u64, u64), errno::Errno>>, Vec<(u32, u64, u64)>) {
+    let mut all = vec![post(Request::Reserve { unit: 0, start: 64, sectors: 8, read_only: true })];
+    all.extend_from_slice(requests);
+    // (the client's split request is run_split's to check)
+    let (replies, _, _) = run_split_with(blk::OP_READ, &all, device);
+    let answers = replies[3..3 + requests.len()].iter().map(|w| wire::reply::<reply::Zero>(w)).collect();
+    (answers, KERNEL.with_borrow(|k| k.provisioned.clone()))
+}
+
+const MIB_SECTORS: u64 = 2048;
+const OK: u64 = blk::STATUS_OK as u64;
+
+#[test]
+fn control_zero_refuses_live_reserved_and_malformed_ranges_before_any_io() {
+    let (answers, io) = run_zero(&[
+        zero(32, 48),       // overlaps the boot reservation
+        zero(8176, 32),     // overlaps an attached extent
+        zero(7, 8),
+        zero(8, 7),
+        zero(0, 0),
+        zero(131064, 16),   // past the disk
+        zero(0, blk::ZERO_MAX_SECTORS + 8),
+    ], |_| {});
+    assert_eq!(answers, [Err(errno::EBUSY), Err(errno::EBUSY), Err(errno::EINVAL), Err(errno::EINVAL),
+        Err(errno::EINVAL), Err(errno::EINVAL), Err(errno::EINVAL)]);
+    assert_eq!(io, []);
+}
+
+#[test]
+fn control_zero_writes_staging_on_a_device_without_write_zeroes() {
+    // 2.5 MiB from sector 16384: staging (root's zeros) a MiB at a time.
+    let (answers, io) = run_zero(&[zero(16384, 5 * MIB_SECTORS / 2)], |_| {});
+    assert_eq!(answers, [Ok((OK, 5 * MIB_SECTORS / 2))]);
+    assert_eq!(io, [(blk::OP_WRITE, 16384, 1 << 20), (blk::OP_WRITE, 16384 + MIB_SECTORS, 1 << 20),
+        (blk::OP_WRITE, 16384 + 2 * MIB_SECTORS, 1 << 19)]);
+}
+
+#[test]
+fn control_zero_uses_the_devices_write_zeroes_up_to_its_limit() {
+    let (answers, io) = run_zero(&[zero(16384, 5 * MIB_SECTORS)], |k| k.zeroes = 2 * MIB_SECTORS as u32);
+    assert_eq!(answers, [Ok((OK, 5 * MIB_SECTORS))]);
+    assert_eq!(io, [(WRITE_ZEROES, 16384, 2 << 20), (WRITE_ZEROES, 16384 + 2 * MIB_SECTORS, 2 << 20),
+        (WRITE_ZEROES, 16384 + 4 * MIB_SECTORS, 1 << 20)]);
+}
+
+#[test]
+fn write_zeroes_asks_at_most_16_mib_whole_4k_blocks_at_once() {
+    // A device that takes 1 GiB, or 7 sectors more than 2 MiB, at once: 16
+    // MiB, or 2 MiB, per request, so each answers within the slice and is a
+    // 4 KiB multiple dom0 goes on from.
+    let (answers, io) = run_zero(&[zero(65536, 20 * MIB_SECTORS)], |k| k.zeroes = (1 << 30) / 512);
+    assert_eq!(answers, [Ok((OK, 20 * MIB_SECTORS))]);
+    assert_eq!(io, [(WRITE_ZEROES, 65536, 16 << 20), (WRITE_ZEROES, 65536 + 16 * MIB_SECTORS, 4 << 20)]);
+    let (answers, io) = run_zero(&[zero(16384, 3 * MIB_SECTORS)], |k| k.zeroes = 2 * MIB_SECTORS as u32 + 7);
+    assert_eq!(answers, [Ok((OK, 3 * MIB_SECTORS))]);
+    assert_eq!(io, [(WRITE_ZEROES, 16384, 2 << 20), (WRITE_ZEROES, 16384 + 2 * MIB_SECTORS, 1 << 20)]);
+}
+
+#[test]
+fn a_failed_write_zeroes_is_written_over_and_never_used_again() {
+    // The device says it zeroes and fails: that range, and every later
+    // one, has zeros written instead; the answer is success.
+    let (answers, io) = run_zero(&[zero(16384, 2 * MIB_SECTORS), zero(20480, MIB_SECTORS)], |k| {
+        (k.zeroes, k.zeroes_fail) = (4 * MIB_SECTORS as u32, true);
+    });
+    assert_eq!(answers, [Ok((OK, 2 * MIB_SECTORS)), Ok((OK, MIB_SECTORS))]);
+    assert_eq!(io, [(WRITE_ZEROES, 16384, 2 << 20), (blk::OP_WRITE, 16384, 1 << 20),
+        (blk::OP_WRITE, 16384 + MIB_SECTORS, 1 << 20), (blk::OP_WRITE, 20480, 1 << 20)]);
+}
+
+#[test]
+fn control_zero_answers_what_one_slice_zeroed() {
+    // Each MiB takes 40 ms of the 100 ms slice (ticks at 1 GHz): the answer
+    // is the prefix done when the slice ran out, at least one MiB.
+    let (answers, io) = run_zero(&[zero(65536, 16 * MIB_SECTORS)], |k| k.provision_ticks = 40_000_000);
+    let Ok((status, done)) = answers[0] else { panic!("{answers:?}") };
+    assert_eq!(status, OK);
+    assert!(done >= MIB_SECTORS && done < 16 * MIB_SECTORS && done % MIB_SECTORS == 0, "{done}");
+    assert_eq!(io.len() as u64, done / MIB_SECTORS);
+    assert!(io.iter().enumerate().all(|(i, &(op, s, b))| op == blk::OP_WRITE && s == 65536 + i as u64 * MIB_SECTORS && b == 1 << 20));
+}
+
+#[test]
+fn control_zero_reports_a_failed_device_with_what_it_zeroed() {
+    // A device error on a write: the status, and the prefix zeroed before.
+    let (answers, io) = run_zero(&[zero(16384, 2 * MIB_SECTORS)], |k| k.status = blk::STATUS_IOERR);
+    assert_eq!(answers, [Ok((blk::STATUS_IOERR as u64, 0))]);
+    assert_eq!(io, [(blk::OP_WRITE, 16384, 1 << 20)]);
 }
 
 #[test]
