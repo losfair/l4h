@@ -10,6 +10,7 @@ import datetime
 import hashlib
 import importlib.util
 import io
+import json
 from pathlib import Path
 import struct
 import unittest
@@ -877,7 +878,7 @@ class EventLog(unittest.TestCase):
         # A SHA-256-only log too.
         log = spec_id((SHA256,)) + b"".join(event2(*e, algs=(SHA256,)) for e in self.EVENTS)
         self.assertEqual({i: a.replay_event_log(log)[0][i] for i in range(15)}, want)
-        self.assertEqual(a.check_event_log(self.log(), {**want, 15: bytes(32)}), len(self.EVENTS))
+        self.assertEqual(a.check_event_log(self.log(), {**want, 15: bytes(32)}), (len(self.EVENTS), 0))
 
     def test_startup_locality(self):
         loc = event2(0, 3, b"StartupLocality\0\x03", digests={SHA1: bytes(20), SHA256: bytes(32), SHA384: bytes(48)})
@@ -913,7 +914,7 @@ class EventLog(unittest.TestCase):
         log = spec_id() + loc4 + hcrtm_ev + tail
         pcrs, _ = a.replay_event_log(log)
         self.assertEqual({i: pcrs[i] for i in range(15)}, want)
-        self.assertEqual(a.check_event_log(log, {**want, 15: bytes(32)}), len(self.EVENTS) + 2)
+        self.assertEqual(a.check_event_log(log, {**want, 15: bytes(32)}), (len(self.EVENTS) + 2, 0))
 
         # Intervening EV_NO_ACTION metadata and another PCR's event are allowed.
         no_action = event2(0, 3, b"SP800-155 Event3\0", digests={SHA256: bytes(32)})
@@ -1003,20 +1004,57 @@ class EventLog(unittest.TestCase):
         with self.assertRaisesRegex(a.Fail, r"error EV_SEPARATOR \(0xffffffff\) in PCR 4"):
             a.replay_event_log(bad)
 
-    def test_verify_cli(self):
-        Evidence.setUpClass()
-        pcrs = {**self.replayed(), a.KEY_PCR: bytes(32)}
+    # Option ROMs: UEFI drivers and applications the firmware loaded from
+    # outside itself, into PCR 2.  The same types elsewhere (l4h, an
+    # application in PCR 4) are not what this checks.
+    DRIVERS = [(2, 0x80000004, b"option rom boot services driver"), (2, 0x80000005, b"option rom runtime driver"),
+               (2, 0x80000003, b"option rom application")]
+
+    def test_efi_drivers_rejected(self):
+        for driver in self.DRIVERS:
+            events = [driver] + self.EVENTS
+            want = {**self.replayed(events), 15: bytes(32)}
+            name = a.EVENT_TYPES[driver[1]]
+            with self.assertRaisesRegex(a.Fail, r"^event 0: %s in PCR 2: .*--allow-efi-drivers" % name):
+                a.check_event_log(self.log(events), want)
+            self.assertEqual(a.check_event_log(self.log(events), want, allow_efi_drivers=True), (len(events), 1))
+        events = self.DRIVERS + self.EVENTS
+        self.assertEqual(a.check_event_log(self.log(events), {**self.replayed(events), 15: bytes(32)}, True),
+                         (len(events), 3))
+        # Not PCR 2, or not a driver or application: not what this checks.
+        events = [(0, 0x80000004, b"in pcr 0"), (4, 0x80000005, b"in pcr 4"), (4, 0x80000003, b"application"),
+                  (2, 0x80000001, b"variable")]
+        events += self.EVENTS
+        self.assertEqual(a.check_event_log(self.log(events), {**self.replayed(events), 15: bytes(32)}), (len(events), 0))
+        # A mismatch is reported first.
+        events = self.DRIVERS + self.EVENTS
+        with self.assertRaisesRegex(a.Fail, "does not match the quote: PCR 2 "):
+            a.check_event_log(self.log(events), {**self.replayed(), 15: bytes(32)})
+
+    @staticmethod
+    def tpm_evidence(pcrs):
         n = Evidence.host.public_key().public_numbers()
         key = {1: 2, -1: 1, -2: n.x.to_bytes(32, "big"), -3: n.y.to_bytes(32, "big")}
         q = quote(a.key_binding(a.point(Evidence.host.public_key()), None), pcrs)
-        ev = {"v": 1, "ak": ecc_public(Evidence.ak, Enrollment.AK_ATTRS), "key": key, "pcrs": pcrs, "quote": q,
-              "quotesig": tpm_signature(Evidence.ak, q)}
+        return {"v": 1, "ak": ecc_public(Evidence.ak, Enrollment.AK_ATTRS), "key": key, "pcrs": pcrs, "quote": q,
+                "quotesig": tpm_signature(Evidence.ak, q)}
+
+    def test_verify_cli(self):
+        Evidence.setUpClass()
+        pcrs = {**self.replayed(), a.KEY_PCR: bytes(32)}
+        ev = self.tpm_evidence(pcrs)
         rep = signed_claims(Evidence.host, {"seal": bitmap(0), "taint": bitmap()})
-        pcr_pins = ["--pcr", "4=" + pcrs[4].hex(), "--pcr", "9=" + pcrs[9].hex()]
+        pcr_pins = ["--pcr", "2=" + pcrs[2].hex(), "--pcr", "4=" + pcrs[4].hex(), "--pcr", "9=" + pcrs[9].hex()]
+        pcr0 = ["--pcr", "0=" + pcrs[0].hex()]
+        driver_events = self.DRIVERS + self.EVENTS
+        driver_pcrs = {**self.replayed(driver_events), a.KEY_PCR: bytes(32)}
+        driver_pins = ["--pcr", "0=" + driver_pcrs[0].hex(), "--pcr", "2=" + driver_pcrs[2].hex(),
+                       "--pcr", "4=" + driver_pcrs[4].hex(), "--pcr", "9=" + driver_pcrs[9].hex()]
         with tempfile.TemporaryDirectory() as d:
             paths = {}
             for name, data in (("ev", cbor(ev)), ("rep", cbor(rep)), ("log", self.log()),
-                               ("bad", self.log(self.EVENTS[:-1]))):
+                               ("bad", self.log(self.EVENTS[:-1])), ("dev", cbor(self.tpm_evidence(driver_pcrs))),
+                               ("dlog", self.log(driver_events))):
                 paths[name] = os.path.join(d, name)
                 Path(paths[name]).write_bytes(data)
             tool = [sys.executable, str(Path(__file__).resolve().parents[1] / "tools/l4h-attest.py")]
@@ -1034,16 +1072,63 @@ class EventLog(unittest.TestCase):
             self.assertRegex(r.stderr, "^l4h-attest: the attestation key is not pinned: .*--ak-name")
             self.assertEqual(r.stdout, "")
             ak = a.tpm_name(ev["ak"]).hex()
-            for partial in ((), ("--pcr", "4=" + pcrs[4].hex()), ("--pcr", "9=" + pcrs[9].hex())):
-                r = run("verify", paths["rep"], paths["ev"], "--ak-name", ak, *partial)
+            # Any of PCR 2, 4 and 9 missing (even with PCR 0): refused.
+            for drop in (None, 0, 1, 2):
+                partial = [x for k in range(3) if k != drop for x in pcr_pins[2 * k:2 * k + 2]] if drop is not None else []
+                r = run("verify", paths["rep"], paths["ev"], "--ak-name", ak, *partial, *pcr0)
                 self.assertEqual(r.returncode, 1, partial)
-                self.assertIn("--insecure-unpinned-measurements", r.stderr)
-            # Pinned AK and pinned PCR 4 & 9: passes with no warning.
+                self.assertEqual(r.stdout, "")
+                self.assertRegex(r.stderr, r"^l4h-attest: TPM platform measurements are not pinned: pass --pcr 2=\.\.\., "
+                                 r"--pcr 4=\.\.\. and --pcr 9=\.\.\., or --insecure-unpinned-measurements\n$")
+            # Pinned AK and pinned PCR 2, 4 & 9: passes, warning only that
+            # PCR 0 (the firmware) is not pinned.
             r = run("verify", paths["rep"], paths["ev"], "--ak-name", ak, *pcr_pins)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertNotIn("event_log_events", r.stdout)
             self.assertIn('"measurements_pinned": true', r.stdout)
-            self.assertNotIn("warning", r.stderr.lower())
+            self.assertEqual(r.stderr.count("WARNING"), 1, r.stderr)
+            self.assertRegex(r.stderr, r"^l4h-attest: WARNING: PCR 0 \(the platform firmware\) was NOT pinned \(--pcr 0=\.\.\.\)")
+            self.assertNotIn("INSECURE", r.stderr)
+            # And PCR 0: no warning at all.
+            r = run("verify", paths["rep"], paths["ev"], "--ak-name", ak, *pcr_pins, *pcr0)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn('"measurements_pinned": true', r.stdout)
+            self.assertEqual(r.stderr, "")
+            # A wrong PCR 2 is caught.
+            r = run("verify", paths["rep"], paths["ev"], "--ak-name", ak, *pcr0, *pcr_pins[2:],
+                    "--pcr", "2=" + "11" * 32)
+            self.assertEqual(r.returncode, 1)
+            self.assertRegex(r.stderr, "^l4h-attest: PCR 2 is %s, not 1{64}\n$" % pcrs[2].hex())
+            # --insecure-unpinned-measurements still warns of PCR 0.
+            r = run("verify", paths["rep"], paths["ev"], "--ak-name", ak, "--insecure-unpinned-measurements")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("INSECURE: --insecure-unpinned-measurements: PCR 2, PCR 4 and PCR 9 were NOT all pinned",
+                          r.stderr)
+            self.assertIn("WARNING: PCR 0 (the platform firmware) was NOT pinned", r.stderr)
+            # Event log with option ROM drivers in PCR 2: refused by
+            # default, accepted (with a warning) with --allow-efi-drivers.
+            r = run("verify", paths["rep"], paths["dev"], "--ak-name", ak, *driver_pins, "--event-log", paths["dlog"])
+            self.assertEqual(r.returncode, 1)
+            self.assertEqual(r.stdout, "")
+            self.assertRegex(r.stderr, "^l4h-attest: event 0: EV_EFI_BOOT_SERVICES_DRIVER in PCR 2: .*"
+                             "--allow-efi-drivers accepts it\n$")
+            r = run("verify", paths["rep"], paths["dev"], "--ak-name", ak, *driver_pins, "--event-log", paths["dlog"],
+                    "--allow-efi-drivers")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            out = json.loads(r.stdout)["host"]
+            self.assertEqual((out["event_log_events"], out["event_log_efi_drivers"]), (len(driver_events), 3))
+            self.assertEqual(r.stderr.count("WARNING"), 1, r.stderr)
+            self.assertIn("WARNING: --allow-efi-drivers: the event log shows 3 UEFI driver(s) or application(s) from "
+                          "outside the firmware (option ROMs; PCR 2)", r.stderr)
+            # Without drivers --allow-efi-drivers changes nothing, and
+            # without an event log it has nothing to allow.
+            r = run("verify", paths["rep"], paths["ev"], "--ak-name", ak, *pcr_pins, *pcr0, "--event-log", paths["log"],
+                    "--allow-efi-drivers")
+            self.assertEqual((r.returncode, r.stderr), (0, ""))
+            self.assertEqual(json.loads(r.stdout)["host"]["event_log_efi_drivers"], 0)
+            r = run("verify", paths["rep"], paths["ev"], "--ak-name", ak, *pcr_pins, *pcr0, "--allow-efi-drivers")
+            self.assertEqual(r.returncode, 1)
+            self.assertRegex(r.stderr, "^l4h-attest: --allow-efi-drivers without --event-log or --cc-event-log")
             r = run("verify", paths["rep"], paths["ev"], "--ak-name", "000b" + "00" * 32, *pcr_pins)
             self.assertEqual(r.returncode, 1)
             self.assertIn("not the pinned one", r.stderr)

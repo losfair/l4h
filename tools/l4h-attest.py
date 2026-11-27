@@ -44,14 +44,18 @@
                 [--pcr N=HEX]... [--ak-name HEX | --insecure-unpinned-ak]
                 [--insecure-unpinned-measurements] [--ignore-tpm]
                 [--ek-ca PEM] [--deny-taint SPEC] [--require-seal SPEC]
-                [--event-log FILE]
+                [--event-log FILE] [--allow-efi-drivers]
       Check a report (l4hctl attest report -o) against the host evidence
       (l4hctl attest evidence -o), and print what they claim as JSON.
       TPM evidence needs --ak-name, the AK enrolled with make-credential:
       without it the attestation key is not known to be a TPM's, which
       only --insecure-unpinned-ak accepts (to read the AK's name before
       enrolling it).  --ek-ca may hold intermediate CAs and their root:
-      each hop is checked.
+      each hop is checked.  TPM evidence also needs --pcr 2=... (option
+      ROMs and UEFI drivers from outside the firmware), --pcr 4=... (the
+      UEFI application, l4h) and --pcr 9=... (l4h.conf, dom0's initrd),
+      or --insecure-unpinned-measurements; without --pcr 0=... (the
+      firmware itself) verify warns.
       By default the guest must have sealed console-in and not taken
       console input before: input after the report would be unattested.
       A multikernel host's report and evidence name the partition the
@@ -59,7 +63,12 @@
       --event-log takes the host's UEFI TPM event log (l4hctl attest
       event-log -o): replayed, it must give the quoted PCRs 0-14, which
       nothing changes after the firmware's ExitBootServices (trustd quotes
-      before it extends PCR 15), and leave PCR 15 zero.  Its events then
+      before it extends PCR 15), and leave PCR 15 zero, and must load no
+      UEFI driver or application from outside the firmware
+      (EV_EFI_BOOT_SERVICES_DRIVER, EV_EFI_RUNTIME_SERVICES_DRIVER or
+      EV_EFI_BOOT_SERVICES_APPLICATION in PCR 2, as option ROMs are; l4h
+      itself is PCR 4's): --allow-efi-drivers accepts them, with a
+      warning.  Its events then
       say what the firmware measured.
       Intel TDX: EVIDENCE may also be the host's TDX evidence (l4hctl
       attest tdx-evidence -o) or the guest driver's TPM and TDX evidence
@@ -78,9 +87,14 @@
       and RTMR 3 be zero: trustd extends it with the key at once, so it
       was the first of this boot.  --mrtd and --rtmr N=HEX pin measurements;
       --cc-event-log (l4hctl attest tdx-event-log -o) must replay to
-      RTMR 0-2 and leave RTMR 3 zero.
+      RTMR 0-2, leave RTMR 3 zero and load no UEFI driver or application
+      in RTMR 0 (as --event-log in PCR 2; --allow-efi-drivers accepts
+      them).  With
+      neither --rtmr 0=... nor --cc-event-log, RTMR 0 (the TD firmware's
+      configuration, TDHOB, ACPI tables, drivers) is unchecked: verify
+      warns.
   l4h-attest.py verify-tdx-quote ANSWER [--tdx-evidence F] [--data HEX]
-                [TDX options as verify]
+                [TDX options as verify] [--allow-efi-drivers]
       A guest's fresh TDX quote (l4hctl attest tdx-quote -o): its
       REPORTDATA must bind the report it carries, and its RTMR 3 the host
       key (extended once from zero); the report is then checked as verify
@@ -292,6 +306,16 @@ class Reader:
 EV_NO_ACTION = 3
 EV_SEPARATOR = 4
 EV_EFI_HCRTM_EVENT = 0x80000010
+# UEFI drivers and applications the firmware loaded from outside its own
+# volumes (option ROMs), PFP 1.06 rev52 10.4.1: measured into PCR 2 (on
+# TDX RTMR 0, CC measurement register 1).  Their code ran before l4h, with
+# the firmware's privilege.  The boot application, l4h, is measured into
+# PCR 4 (RTMR 1) instead, which these checks leave alone.
+EV_EFI_BOOT_SERVICES_APPLICATION = 0x80000003
+EV_EFI_BOOT_SERVICES_DRIVER = 0x80000004
+EV_EFI_RUNTIME_SERVICES_DRIVER = 0x80000005
+EFI_DRIVER_EVENTS = (EV_EFI_BOOT_SERVICES_APPLICATION, EV_EFI_BOOT_SERVICES_DRIVER, EV_EFI_RUNTIME_SERVICES_DRIVER)
+EFI_DRIVER_PCR = 2
 EV_SEPARATOR_ERR_SHA256 = hashlib.sha256(b"\xff\xff\xff\xff").digest()
 EV_SEPARATOR_ERR_SHA384 = hashlib.sha384(b"\xff\xff\xff\xff").digest()
 TPM_ALG_SHA256 = 0x000B
@@ -444,9 +468,25 @@ def replay_event_log(log):
     return pcrs, events
 
 
-def check_event_log(log, quoted):
+def efi_drivers(events, register, what, event="event"):
+    """The events in `register` loading a UEFI driver or application from outside the
+    firmware, as "EVENT N: TYPE in WHAT"."""
+    return ["%s %d: %s in %s" % (event, n, EVENT_TYPES[e["type"]], what) for n, e in enumerate(events)
+            if e["pcr"] == register and e["type"] in EFI_DRIVER_EVENTS]
+
+
+def check_efi_drivers(drivers, allow):
+    if drivers and not allow:
+        raise Fail("%s: UEFI code from outside the firmware (an option ROM's driver or application) ran before l4h; "
+                   "--allow-efi-drivers accepts it" % drivers[0])
+    return len(drivers)
+
+
+def check_event_log(log, quoted, allow_efi_drivers=False):
     """That the log replays to the quoted PCRs 0-14 (`quoted`, the
-    evidence's {index: value}); the number of its events."""
+    evidence's {index: value}) and loads no UEFI driver or application from outside the
+    firmware unless `allow_efi_drivers`; the number of its events and of
+    such drivers."""
     pcrs, events = replay_event_log(log)
     # PCR 15 is trustd's alone: a log in which the firmware extended it
     # would have the key's quote taken over a PCR 15 that was not zero.
@@ -458,7 +498,8 @@ def check_event_log(log, quoted):
         if quoted[i] != pcrs[i]:
             raise Fail("event log does not match the quote: PCR %d replays to %s, the quote has %s"
                        % (i, pcrs[i].hex(), quoted[i].hex()))
-    return len(events)
+    drivers = check_efi_drivers(efi_drivers(events, EFI_DRIVER_PCR, "PCR %d" % EFI_DRIVER_PCR), allow_efi_drivers)
+    return len(events), drivers
 
 
 def event_log_summary(log):
@@ -929,6 +970,14 @@ def load_cas(ek_ca):
         raise Fail("no CA certificate in %s" % ek_ca)
 
 
+# What `verify` requires pinned in TPM evidence (unless
+# --insecure-unpinned-measurements): PCR 2, UEFI drivers from outside the
+# firmware (option ROMs); PCR 4, the UEFI application (l4h); PCR 9,
+# l4h.conf and dom0's initrd.  PCR 0, the firmware itself, is only warned
+# about: a cloud's vTPM firmware is the cloud's to vouch for.
+TPM_REQUIRED_PCRS = (2, 4, 9)
+
+
 @checked("evidence")
 def check_evidence(ev, pins, ak_name, ek_ca):
     """The host's signing key and what the evidence shows about it."""
@@ -997,7 +1046,7 @@ def check_evidence(ev, pins, ak_name, ek_ca):
         **({} if partition is None else {"partition": partition, "keys_before": before}),
         "ak_name": name.hex(),
         "ak_pinned": ak_name is not None,
-        "measurements_pinned": 4 in pins and 9 in pins,
+        "measurements_pinned": all(i in pins for i in TPM_REQUIRED_PCRS),
         "reset_count": q["reset_count"],
         "restart_count": q["restart_count"],
         "pcrs": {str(i): pcrs[i].hex() for i in sorted(pcrs)},
@@ -1671,11 +1720,13 @@ class TdxPolicy:
     only for tests), debug or not, and measurements."""
 
     def __init__(self, roots, collateral=None, allowed=DEFAULT_TCB_STATUS, allow_debug=False, stale_ok=False,
-                 mrtd=None, rtmrs=None, cc_event_log=None, now=None, allow_migratable=False, require_collateral=True):
+                 mrtd=None, rtmrs=None, cc_event_log=None, now=None, allow_migratable=False, require_collateral=True,
+                 allow_efi_drivers=False):
         self.roots, self.collateral, self.allowed = roots, collateral, frozenset(allowed)
         self.require_collateral = require_collateral
         self.allow_debug, self.stale_ok, self.allow_migratable = allow_debug, stale_ok, allow_migratable
         self.mrtd, self.rtmrs, self.cc_event_log = mrtd, rtmrs or {}, cc_event_log
+        self.allow_efi_drivers = allow_efi_drivers
         self.now = now or datetime.datetime.now(datetime.timezone.utc)
 
 
@@ -1745,7 +1796,8 @@ def verify_tdx_quote(q, policy):
         "pck_subject": leaf.subject.rfc4514_string(),
     }
     if policy.cc_event_log is not None:
-        out["cc_event_log_events"] = check_cc_event_log(policy.cc_event_log, f)
+        out["cc_event_log_events"], out["cc_event_log_efi_drivers"] = check_cc_event_log(
+            policy.cc_event_log, f, policy.allow_efi_drivers)
     if policy.collateral:
         out.update(check_collateral(p, ext, leaf, pck_ca, pck_root, policy.roots, policy.collateral, policy.allowed,
                                     policy.now, policy.stale_ok))
@@ -1820,9 +1872,11 @@ def replay_cc_event_log(log):
     return rtmrs, events
 
 
-def check_cc_event_log(log, fields):
+def check_cc_event_log(log, fields, allow_efi_drivers=False):
     """That the CC event log replays to the quote's RTMR 0-2 (RTMR 3 is
-    trustd's key); the number of its events."""
+    trustd's key) and loads no UEFI driver or application from outside the firmware
+    (in RTMR 0) unless `allow_efi_drivers`; the number of its events and
+    of such drivers."""
     rtmrs, events = replay_cc_event_log(log)
     # RTMR 3 is trustd's alone: the firmware must not have extended it.
     if rtmrs[TDX_KEY_RTMR] != bytes(48):
@@ -1831,7 +1885,9 @@ def check_cc_event_log(log, fields):
         if rtmrs[i] != fields["rtmr%d" % i]:
             raise Fail("CC event log does not match the quote: RTMR %d replays to %s, the quote has %s"
                        % (i, rtmrs[i].hex(), fields["rtmr%d" % i].hex()))
-    return len(events)
+    # Register index 1 is RTMR 0, where the TD firmware measures drivers.
+    drivers = check_efi_drivers(efi_drivers(events, 1, "RTMR 0", "CC event"), allow_efi_drivers)
+    return len(events), drivers
 
 
 def cc_event_log_summary(log):
@@ -2071,7 +2127,7 @@ def tdx_policy(a):
     return TdxPolicy(roots, col, allowed, a.allow_debug, a.allow_stale_collateral,
                      bytes.fromhex(a.mrtd) if a.mrtd else None, rtmrs,
                      read(a.cc_event_log) if a.cc_event_log else None, allow_migratable=a.allow_migratable,
-                     require_collateral=not a.insecure_skip_collateral)
+                     require_collateral=not a.insecure_skip_collateral, allow_efi_drivers=a.allow_efi_drivers)
 
 
 TDX_OPTIONS = ("intel_root_ca", "collateral_dir", "tcb_info", "qe_identity", "pck_crl", "tcb_signing_chain",
@@ -2085,7 +2141,14 @@ def tdx_options_given(a):
     return any(getattr(a, o) for o in TDX_OPTIONS)
 
 
-def tdx_warnings(info):
+def efi_driver_warning(n, where):
+    print("l4h-attest: WARNING: --allow-efi-drivers: the event log shows %d UEFI driver(s) or application(s) from "
+          "outside the firmware (option ROMs; %s), whose code ran before l4h: only a pinned %s says which"
+          % (n, where, where),
+          file=sys.stderr)
+
+
+def tdx_warnings(info, policy):
     if info.get("tcb_status") is None:
         print("l4h-attest: WARNING: INSECURE: --insecure-skip-collateral: the QE's identity (MRSIGNER, product, "
               "SVN, debug), the TDX module's signer (MRSIGNERSEAM), the CRLs and the TCB status were NOT checked: "
@@ -2093,6 +2156,12 @@ def tdx_warnings(info):
     if not info.get("measurements_pinned", False):
         print("l4h-attest: WARNING: INSECURE: --insecure-unpinned-measurements: MRTD, RTMR 1 and RTMR 2 were NOT all "
               "pinned (--mrtd --rtmr 1=... --rtmr 2=...)", file=sys.stderr)
+    if 0 not in policy.rtmrs and policy.cc_event_log is None:
+        print("l4h-attest: WARNING: RTMR 0 was neither pinned (--rtmr 0=...) nor replayed (--cc-event-log): the TD "
+              "firmware's configuration (TDHOB, CFV), its ACPI tables and the UEFI drivers it loaded before l4h were "
+              "NOT checked", file=sys.stderr)
+    if info.get("cc_event_log_efi_drivers"):
+        efi_driver_warning(info["cc_event_log_efi_drivers"], "RTMR 0")
 
 
 def main():
@@ -2126,12 +2195,15 @@ def main():
                         "AK's name before enrolling it, or for tests)")
     v.add_argument("--insecure-unpinned-measurements", action="store_true",
                    help="INSECURE: accept evidence without pinning platform measurements (--mrtd/--rtmr 1,2 for TDX; "
-                        "--pcr 4,9 for TPM)")
+                        "--pcr 2,4,9 for TPM)")
     v.add_argument("--deny-taint", default="console-in", help="deny host names, bit numbers or ranges (default: console-in; '' disables)")
     v.add_argument("--require-seal", default="console-in",
                    help="require sealed host names, bit numbers or ranges (default: console-in; '' disables)")
     v.add_argument("--ek-ca", help="CA certificates (PEM, one or more) one of which issued the EK certificate")
     v.add_argument("--event-log", help="the host's UEFI TPM event log (l4hctl attest event-log -o): must replay to PCRs 0-14")
+    v.add_argument("--allow-efi-drivers", action="store_true",
+                   help="accept an event log (--event-log, --cc-event-log) in which the firmware loaded UEFI drivers or "
+                        "applications from outside itself (option ROMs; PCR 2, RTMR 0)")
     add_tdx_options(v)
     tq = sub.add_parser("verify-tdx-quote")
     tq.add_argument("answer", help="l4hctl attest tdx-quote -o: the host key, a fresh TDX quote and the report it is over")
@@ -2140,6 +2212,9 @@ def main():
     tq.add_argument("--launch", help="expected launch digest (hex)")
     tq.add_argument("--insecure-unpinned-measurements", action="store_true",
                     help="INSECURE: accept a TDX quote without pinning --mrtd, --rtmr 1=... and --rtmr 2=...")
+    tq.add_argument("--allow-efi-drivers", action="store_true",
+                    help="accept a CC event log (--cc-event-log) in which the TD firmware loaded UEFI drivers or "
+                         "applications from outside itself (RTMR 0)")
     tq.add_argument("--deny-taint", default="console-in", help="as verify")
     tq.add_argument("--require-seal", default="console-in", help="as verify")
     add_tdx_options(tq)
@@ -2193,6 +2268,8 @@ def main():
                 tpm_ev = None
             if tpm_ev is None and tdx_ev is None:
                 raise Fail("no evidence")
+            if a.allow_efi_drivers and not (a.event_log or a.cc_event_log):
+                raise Fail("--allow-efi-drivers without --event-log or --cc-event-log: no event log to check")
             out, key, partition = {}, None, None
             ak_name = bytes.fromhex(a.ak_name) if a.ak_name else None
             if tpm_ev is not None:
@@ -2202,12 +2279,13 @@ def main():
                 if ak_name is None and not a.insecure_unpinned_ak:
                     raise Fail("the attestation key is not pinned: enroll it (make-credential, l4hctl attest activate) "
                                "and give its name with --ak-name, or --insecure-unpinned-ak to accept any key")
-                if (4 not in pins or 9 not in pins) and not a.insecure_unpinned_measurements:
-                    raise Fail("TPM platform measurements are not pinned: pass --pcr 4=... and --pcr 9=..., "
+                if any(i not in pins for i in TPM_REQUIRED_PCRS) and not a.insecure_unpinned_measurements:
+                    raise Fail("TPM platform measurements are not pinned: pass --pcr 2=..., --pcr 4=... and --pcr 9=..., "
                                "or --insecure-unpinned-measurements")
                 key, partition, host = check_evidence(tpm_ev, pins, ak_name, a.ek_ca)
                 if a.event_log:
-                    host["event_log_events"] = check_event_log(read(a.event_log), tpm_ev["pcrs"])
+                    host["event_log_events"], host["event_log_efi_drivers"] = check_event_log(
+                        read(a.event_log), tpm_ev["pcrs"], a.allow_efi_drivers)
                 out["host"] = host
             elif a.event_log or pins or a.ak_name or a.ek_ca or a.insecure_unpinned_ak:
                 raise Fail("TPM options without TPM evidence")
@@ -2238,15 +2316,23 @@ def main():
                 print("l4h-attest: WARNING: INSECURE: --insecure-unpinned-ak: the attestation key is not pinned "
                       "(--ak-name), so not known to be a TPM's", file=sys.stderr)
             if tpm_ev is not None and not out["host"]["measurements_pinned"]:
-                print("l4h-attest: WARNING: INSECURE: --insecure-unpinned-measurements: PCR 4 and PCR 9 were NOT pinned "
-                      "(--pcr 4=... --pcr 9=...)", file=sys.stderr)
+                print("l4h-attest: WARNING: INSECURE: --insecure-unpinned-measurements: PCR 2, PCR 4 and PCR 9 were NOT "
+                      "all pinned (--pcr 2=... --pcr 4=... --pcr 9=...)", file=sys.stderr)
+            if tpm_ev is not None and 0 not in pins:
+                print("l4h-attest: WARNING: PCR 0 (the platform firmware) was NOT pinned (--pcr 0=...): on bare metal, "
+                      "pin it with the AK (--ak-name) from a known-good boot; on a cloud vTPM whose firmware the cloud "
+                      "vouches for (GCE), this may be accepted", file=sys.stderr)
+            if out.get("host", {}).get("event_log_efi_drivers"):
+                efi_driver_warning(out["host"]["event_log_efi_drivers"], "PCR %d" % EFI_DRIVER_PCR)
             if tdx_ev is not None:
-                tdx_warnings(out["tdx"])
+                tdx_warnings(out["tdx"], policy)
         elif a.cmd == "verify-tdx-quote":
             policy = tdx_policy(a)
             if (policy.mrtd is None or 1 not in policy.rtmrs or 2 not in policy.rtmrs) and not a.insecure_unpinned_measurements:
                 raise Fail("TDX platform measurements are not pinned: pass --mrtd, --rtmr 1=... and --rtmr 2=..., "
                            "or --insecure-unpinned-measurements")
+            if a.allow_efi_drivers and not a.cc_event_log:
+                raise Fail("--allow-efi-drivers without --cc-event-log: no event log to check")
             ans = cbor_decode(read(a.answer))
             key, info = check_tdx_quote_answer(ans, policy)
             if a.tdx_evidence:
@@ -2257,7 +2343,7 @@ def main():
             launch = bytes.fromhex(a.launch) if a.launch else None
             guest = check_report(cbor_decode(ans["report"]), key, data, launch, a.deny_taint, a.require_seal)
             print(json.dumps({"tdx": info, "guest": guest}, indent=2))
-            tdx_warnings(info)
+            tdx_warnings(info, policy)
         elif a.cmd == "event-log":
             log = read(a.log)
             if a.cc or is_cc_event_log(log):

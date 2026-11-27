@@ -2012,12 +2012,14 @@ release file and needs Python's \texttt{cryptography} package:
 \begin{lstlisting}[language=bash]
 tools/l4h-attest.py measure vmlinux --initrd initrd --cmdline "console=hvc0"
 tools/l4h-attest.py verify report evidence --data $NONCE --launch $DIGEST \
-    --ak-name $AK --pcr 4=$PCR4 --pcr 9=$PCR9
+    --ak-name $AK --pcr 2=$PCR2 --pcr 4=$PCR4 --pcr 9=$PCR9
 \end{lstlisting}
 On a host booted by FL4's own UEFI loader, \cmd{l4hctl attest event-log -o
 eventlog} (or \file{/sys/kernel/l4h/attest/event\_log}) gives the
 firmware's TPM event log, the same in every guest; \texttt{verify
---event-log eventlog} replays it and requires the quoted PCRs 0--14, and
+--event-log eventlog} replays it and requires the quoted PCRs 0--14 and
+no UEFI driver or application loaded from outside the firmware (an
+option ROM's, in PCR~2, such as \texttt{EV\_EFI\_BOOT\_SERVICES\_APPLICATION}; \texttt{--allow-efi-drivers} accepts them, with a warning), and
 \cmd{tools/l4h-attest.py event-log eventlog} lists what the firmware
 measured.
 \cmd{measure} prints the launch digest a guest gets from those files,
@@ -2035,7 +2037,9 @@ fails unless every check holds:
         given \texttt{--insecure-unpinned-ak}, which is only for reading the
         AK's name before enrolling it);
   \item the report carries the nonce and launch digest given;
-  \item each PCR has the value given with \texttt{--pcr};
+  \item each PCR has the value given with \texttt{--pcr}; PCRs 2, 4 and~9
+        must be given (or \texttt{--insecure-unpinned-measurements}), and
+        without PCR~0 (the firmware) \cmd{verify} warns;
   \item the guest took no console input and has sealed \texttt{console-in}
         (\texttt{--deny-taint} and \texttt{--require-seal} change which
         flags are checked; \texttt{--deny-taint ''} and
@@ -2075,7 +2079,9 @@ temporarily unavailable''): try again later.
 
 \paragraph{Choosing PCR values.} Take reference values from a known-good boot
 of the same l4h application and firmware boot path. Firmware measures the
-application into PCR~4. When moving from a GRUB-based FL4 release to the
+application into PCR~4, UEFI drivers and option ROMs from outside itself
+into PCR~2, and itself into PCR~0: on bare metal pin PCR~0 too, from the
+boot whose AK you enrolled. When moving from a GRUB-based FL4 release to the
 native loader, update the expected PCRs~4, 8 and~9. On FL4 the verifier can
 also replay the firmware event log with \cmd{verify --event-log}.
 

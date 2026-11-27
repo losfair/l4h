@@ -119,11 +119,12 @@ json() { python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(eval
 [ "$(json "$out/run/vm.json" 'd["guest"]["dom0"]')" = False ] || fail "guest marked dom0"
 [ "$(json "$out/run/vm.json" 'd["guest"]["ram"]')" = $((64 << 20)) ] || fail "guest RAM"
 # The firmware and GRUB measured the boot.
+pcr2=$(json "$out/run/dom0.json" 'd["host"]["pcrs"]["2"]')
 pcr4=$(json "$out/run/dom0.json" 'd["host"]["pcrs"]["4"]')
 pcr9=$(json "$out/run/dom0.json" 'd["host"]["pcrs"]["9"]')
 [ "$pcr4" != "$(printf '0%.0s' $(seq 64))" ] || fail "PCR 4 empty"
 [ "$pcr9" != "$(printf '0%.0s' $(seq 64))" ] || fail "PCR 9 empty"
-pcr_pins=(--pcr "4=$pcr4" --pcr "9=$pcr9")
+pcr_pins=(--pcr "2=$pcr2" --pcr "4=$pcr4" --pcr "9=$pcr9")
 # Tampering is caught.
 cp "$out/run/dom0.report" "$out/run/bad.report"
 printf '\x00' | dd of="$out/run/bad.report" bs=1 seek=40 conv=notrunc status=none

@@ -4837,7 +4837,13 @@ The chain has four links.
      under it;
    - the quote's qualifying data is K's hash;
    - the PCR values match the quote's digest, and PCR 15 is zero;
-   - the PCRs have the expected values (`--pcr`);
+   - the PCRs have the expected values (`--pcr`). PCR 2 (UEFI drivers
+     and option ROMs from outside the firmware), PCR 4 (the UEFI
+     application, l4h) and PCR 9 (l4h.conf, dom0's initrd) must be pinned,
+     or `--insecure-unpinned-measurements` given (with a warning). PCR 0
+     (the firmware itself) is not required, since a cloud's vTPM firmware
+     is the cloud's to vouch for, but `verify` warns without it: on bare
+     metal pin it with the AK from a known-good boot;
    - the EK certificate is issued by a CA certificate given with `--ek-ca`;
      when the file also holds that CA's issuer (a manufacturer's
      intermediate and root), every hop up to a self-signed root is checked
@@ -4852,9 +4858,14 @@ The chain has four links.
    - with `--event-log`, the host's event log (TCG2 crypto agile format)
      replays, in its SHA-256 bank, to the quoted PCRs 0–14 and leaves PCR 15
      (trustd's) zero, from a StartupLocality of 0 or 3, or 4 when PCR 0's
-     first extended event is `EV_EFI_HCRTM_EVENT` (`"HCRTM"`); its events
-     then say what the firmware measured (`l4h-attest.py event-log` lists
-     them). `measure` computes the digest from the kernel
+     first extended event is `EV_EFI_HCRTM_EVENT` (`"HCRTM"`), and must
+     show no UEFI driver or application loaded from outside the firmware
+     (`EV_EFI_BOOT_SERVICES_DRIVER`, `EV_EFI_RUNTIME_SERVICES_DRIVER` or
+     `EV_EFI_BOOT_SERVICES_APPLICATION` in PCR 2, as option ROMs are; l4h
+     itself is measured into PCR 4) unless `--allow-efi-drivers` (which
+     prints how many, in `event_log_efi_drivers`, with a warning); its
+     events then say what the firmware measured (`l4h-attest.py
+     event-log` lists them). `measure` computes the digest from the kernel
      (`vmlinux` in a release's debug archive), initramfs and command line.
 
    **AK enrollment.** A quote only proves something if the AK is in a real
@@ -5186,9 +5197,14 @@ and TEE_TCB_SVN2), the TDX module and the QE. Collateral is required: the
 QE report is signed by the platform's real PCK key for any enclave on an
 SGX machine with flexible launch control, so without QE identity anyone's
 enclave could sign quotes; `--insecure-skip-collateral` skips it for tests
-only. Then K's binding with RTMR 3 zero, `--mrtd`/`--rtmr` pins, and
+only. Then K's binding with RTMR 3 zero, `--mrtd`/`--rtmr` pins (MRTD,
+RTMR 1 and 2 required unless `--insecure-unpinned-measurements`), and
 `--cc-event-log` replayed (SHA-384; register index 1–4 is RTMR 0–3) to
-RTMR 0–2, with RTMR 3 not extended. `verify-tdx-quote` checks a fresh
+RTMR 0–2, with RTMR 3 not extended and no UEFI driver or application
+from outside the firmware in RTMR 0 (as for PCR 2 above; `--allow-efi-drivers`, in
+`cc_event_log_efi_drivers`). With neither `--rtmr 0=...` nor
+`--cc-event-log`, RTMR 0 (TDHOB, CFV, ACPI tables, drivers) is
+unchecked, and `verify` warns. `verify-tdx-quote` checks a fresh
 quote. The VMM and the cloud's TPM are then outside the TCB for what TDX
 covers: memory and the TD's measurements; the quote says nothing of what
 the TPM's PCRs measure, and a verifier that needs both checks both.
