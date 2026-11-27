@@ -1490,9 +1490,8 @@ create fails with `-ENODEV`. `l4hctl list` shows them as `hvm`.
     taints. `l4hctl attest` uses the port where there is no
     `/dev/l4h-attest`, with the same commands; there is no configfs-tsm
     provider.
-  - *Seals.* `CONSOLE_IN` and `CONSOLE_OUT` gate dom0's console
-    operations on an HVM guest as on any (they are vmmgr's, by guest
-    instance).
+  - *Seals.* `CONSOLE_IN` gates dom0's console input to an HVM guest
+    as to any (it is vmmgr's, by guest instance).
 - **Kernel configuration.** Every HVM guest, on both architectures, has
   a second virtio-console (PCI `00:1e.0`, `hvm::KCONFIG_SLOT`; devices
   take slots 1 to 29) with one port, named `l4h.kconfig` (`abi.h`,
@@ -4905,22 +4904,25 @@ checking taint alone leaves a session key exposed after its report.
 
 | Bits | Who acts | Who seals | Meaning and trust |
 |------|----------|-----------|-------------------|
-| 0–31 | Host actor (vmmgr) | Guest userspace | Host TCB enforces the refusal; 0 is `CONSOLE_IN`, 1 is `CONSOLE_OUT`, 2–31 reserved |
+| 0–31 | Host actor (vmmgr) | Guest userspace | Host TCB enforces the refusal; 0 is `CONSOLE_IN`, 1–31 reserved |
 | 32–63 | Reserved for host actors | Nobody | Reserved |
 | 64–127 | Guest kernel | Nobody | Bit 64 + Linux's taint flag; trusted as far as the measured kernel |
 | 128–255 | Guest userspace | Guest userspace | Workload-defined actions; the workload must honour refusal |
 
 - `CONSOLE_WRITE` takes `CONSOLE_IN` before injecting bytes, including input
-  queued before start. `CONSOLE_READ` and `GPU_READ` take `CONSOLE_OUT`
-  before disclosing text or pixels, or how much the guest wrote or drew
-  (the console's head, the display's frame counter and format). Empty
-  operations do not taint while the guest has output nothing; a write
-  that finds its ring full does. Every call checks seals, empty ones
-  included. An image copied into dom0's data area taints even if it changed
-  and the read returns `-EAGAIN`. dom0's own console is exempt. The serial
-  monitor never injects guest input. Debug builds also copy guest output to
-  the physical serial port; that is trusted debug output, not a dom0
-  control op.
+  queued before start. An empty write does not taint; a write that finds
+  its ring full does. Every write checks the seal, empty ones included.
+  dom0's own console is exempt. The serial monitor never injects guest
+  input.
+- **Guest output is not secret.** A guest's console output (text console
+  and display) is diagnostic output: in every build, not only debug ones,
+  the VMM copies it through `l4h-logd` to the host's serial port, and its
+  console and display reach the host's consoles and framebuffer; under
+  TDX the serial port and virtio-console are the untrusted VMM's. No flag
+  gates it: `CONSOLE_READ` and `GPU_READ` take no bit, and nothing a
+  report says keeps it confidential. A guest must not print secrets to
+  its console or display. (Bit 1, which once named `CONSOLE_OUT` for
+  dom0's reads alone, is reserved.)
 - **Rule for new control ops:** reading or changing a running guest's state
   outside the devices attached before start needs an action bit, recorded
   before the effect and refused after sealing. Register access, memory
@@ -4995,7 +4997,7 @@ checking taint alone leaves a session key exposed after its report.
   context, and flushes them under the request lock before any report; probe
   sends existing taints, failed sends are retried, and the kernel never
   seals on its own.
-- **Tools.** `l4hctl attest flags`, `seal console-in|console-out|BIT...` and
+- **Tools.** `l4hctl attest flags`, `seal console-in|BIT...` and
   `act [--seal] BIT...` expose the gates; refused actions exit 1. Sysfs
   `/sys/kernel/l4h/attest/{taint,seal}` prints bit lists. A measured
   initramfs seals early by calling `l4hctl attest seal console-in` from init;

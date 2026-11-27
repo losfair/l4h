@@ -146,7 +146,9 @@ fn create(
     cfg.io_pool_gpa = g.pool.gpa as u64;
     cfg.io_pool_size = g.pool.size as u64;
     cfg.dom0 = g.dom0 as u32;
-    // Guest console lines are queued for logd in every build.
+    // Guest console output is non-secret diagnostic output, mirrored to
+    // logd (the host's serial port and consoles) in every build; no flag
+    // gates it, nor dom0's CONSOLE_READ and GPU_READ.
     cfg.serial = 1;
     [cfg.epoch_ns, cfg.epoch_ticks] = host_info.clock_anchor;
     cfg.mem_dev = g.mem_dev.map_or(0, |d| d as u32 + 1);

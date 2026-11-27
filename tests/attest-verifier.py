@@ -69,8 +69,11 @@ class Verify(unittest.TestCase):
         with self.assertRaisesRegex(a.Fail, "console-in"):
             self.check(rep)
         got = self.check(rep, deny_taint="")
-        self.assertEqual(got["taint_bits"], ["0(console-in)", "1(console-out)", "65(F)", "200"])
+        # Bit 1 (once console-out) is reserved: a number, no name.
+        self.assertEqual(got["taint_bits"], ["0(console-in)", "1", "65(F)", "200"])
         self.check(self.signed(taint=bitmap(1, 65, 200), seal=bitmap(0)))
+        with self.assertRaisesRegex(a.Fail, "invalid flag specification: console-out"):
+            self.check(rep, deny_taint="console-out")
 
     def test_default_requires_input_sealed(self):
         # Unsealed, input could come after the report: refused unless the
@@ -81,9 +84,10 @@ class Verify(unittest.TestCase):
         self.check(rep, require_seal="")
         self.check(self.signed(taint=bitmap(), seal=bitmap(0)))
         # Not overridden by another requirement unless it says so.
+        rep = self.signed(taint=bitmap(), seal=bitmap(130))
         with self.assertRaises(a.Fail):
-            self.check(rep, require_seal="console-in,console-out")
-        self.check(rep, require_seal="console-out")
+            self.check(rep, require_seal="console-in,130")
+        self.check(rep, require_seal="130")
 
     def test_required_seal_and_guest_policy(self):
         rep = self.signed(taint=bitmap(65, 200), seal=bitmap(0, 130))

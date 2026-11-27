@@ -143,26 +143,20 @@ pub fn attach(g: &mut Guest, alloc: &mut Alloc, width: u32, height: u32) -> Resu
 /// CTL_GPU_READ: copy the image of guest `g` from byte `offset` into `to`
 /// (dom0's control data area, CTL_LOAD_MAX bytes).  The size is vmmgr's
 /// own, not what l4h-vmm may have written in the header.
-pub fn read(g: &Guest, offset: u64, to: *mut u8, before_copy: impl FnOnce(bool) -> Result<(), Errno>) -> Result<[u64; 6], Errno> {
+pub fn read(g: &Guest, offset: u64, to: *mut u8) -> Result<[u64; 6], Errno> {
     let (width, height) = g.gpu.ok_or(EINVAL)?;
     let base = self_display_va(g.id);
     // l4h-vmm's to write: only its atomics are referred to.
     let hdr = base as *const DisplayHeader;
     let (seq, format) = unsafe { (&(*hdr).frame, &(*hdr).format) };
     let frame = seq.load(Ordering::Acquire);
-    // The answer discloses the frame counter (an odd one by EAGAIN) and
-    // the format even when it copies nothing: whether and how often the
-    // guest drew is its output too.
+    if frame & 1 != 0 {
+        return Err(EAGAIN);
+    }
     let format = format.load(Ordering::Relaxed);
     let total = image_bytes(width, height) as u64;
     let off = offset.min(total);
     let n = (total - off).min(abi::CTL_LOAD_MAX) as usize;
-    // Once copied into dom0's data area the pixels are disclosed, even
-    // if the frame changes and we ultimately return EAGAIN.
-    before_copy(n != 0 || frame != 0 || format != 0)?;
-    if frame & 1 != 0 {
-        return Err(EAGAIN);
-    }
     // l4h-vmm may be writing meanwhile: the frame counter tells.
     unsafe { host::gpu::copy_volatile((base + IMAGE_OFFSET + off as usize) as *const u8, to, n) };
     fence(Ordering::Acquire);

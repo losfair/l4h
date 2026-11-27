@@ -56,17 +56,25 @@ fn guest(mode: &str, no_tpm: bool) {
     }
     assert_eq!(f.taint, [0; 32]);
     if mode == "fresh" { record("fresh", no_tpm); return; }
-    let f = attest::seal(&bits(&["console-out"])).unwrap();
-    assert_eq!(f.taint, [0; 32]);
-    assert_eq!(f.seal[0], 2);
-    if mode == "clean" { record("clean", no_tpm); return; }
+    // Bit 1 (once CONSOLE_OUT) is reserved, as every host bit but
+    // CONSOLE_IN: not sealable.
+    assert_eq!(raw_attest(5, &bits(&["1"])), Err(22));
+    assert_eq!(attest::flags().unwrap().seal, [0; 32]);
+    if mode == "clean" {
+        let f = attest::seal(&bits(&["console-in"])).unwrap();
+        assert_eq!((f.taint, f.seal[0]), ([0; 32], 1));
+        record("clean", no_tpm);
+        return;
+    }
+    // dom0 waits for this (console output is not gated) before its input.
+    println!("FLAGVM: ready for input");
     let mut line = String::new();
     io::stdin().lock().read_line(&mut line).unwrap();
     assert_eq!(line.trim(), "provisioned");
     assert_eq!(attest::flags().unwrap().taint[0], 1);
     record("injected", no_tpm);
     let f = attest::seal(&bits(&["console-in"])).unwrap();
-    assert_eq!((f.taint[0], f.seal[0]), (1, 3));
+    assert_eq!((f.taint[0], f.seal[0]), (1, 1));
 
     fs::write("/proc/sys/kernel/tainted", b"2\n").unwrap();
     attest::act(&bits(&["200"]), false).unwrap();
@@ -99,13 +107,24 @@ fn guest(mode: &str, no_tpm: bool) {
     assert!((a == 0 && b == 1) || (a == 1 && b == 0));
     let f = attest::flags().unwrap();
     for n in [0, 65, 140, 141, 200] { assert!(has(&f.taint, n), "missing taint {n}"); }
-    for n in [0, 1, 130, 140, 141] { assert!(has(&f.seal, n), "missing seal {n}"); }
+    for n in [0, 130, 140, 141] { assert!(has(&f.seal, n), "missing seal {n}"); }
+    assert!(!has(&f.seal, 1));
     assert!(fs::read_to_string("/sys/kernel/l4h/attest/taint").unwrap().trim().split(',').any(|s| s == "65"));
     assert!(fs::read_to_string("/sys/kernel/l4h/attest/seal").unwrap().trim().split(',').any(|s| s == "130"));
     record("gates", no_tpm);
     println!("FLAGVM: PASS{}", if no_tpm { " no TPM" } else { "" });
 }
 fn stopped(c: &Ctl, vm: u64) { wait(|| c.vm_list().unwrap().iter().any(|v| v.id == vm && v.state == 3)); }
+/// Wait for `line` in guest `vm`'s console output.
+fn printed(c: &Ctl, vm: u64, line: &[u8]) {
+    let (mut off, mut seen) = (0, Vec::new());
+    wait(|| {
+        let (next, b, _) = c.console_read(vm, off).unwrap();
+        off = next;
+        seen.extend_from_slice(&b);
+        seen.windows(line.len()).any(|w| w == line)
+    });
+}
 fn dom0(no_tpm: bool) {
     let c = Ctl::open().unwrap();
     let initrd = fs::read("/bin/flagsvm.cpio.gz").unwrap();
@@ -119,22 +138,25 @@ fn dom0(no_tpm: bool) {
     let fresh_cmd = cmd("fresh");
     let spec = |mode| VmSpec { name: "flags", mem: 128 << 20, vcpus: 2, initrd: &initrd,
         cmdline: mode, disks: vec![], volumes: vec![], nics: vec![], io_pool: 0, gpu: Some((64, 64)), usbs: vec![], kernel: None };
-    // A separate clean instance avoids racing its report against input:
-    // dom0 cannot observe completion through a sealed output console.
+    // A clean instance seals console-in at once: input is then refused
+    // (-EPERM, without taint), while its console output and display stay
+    // readable (diagnostic output, not gated by a flag).
     let (id, _) = c.create_vm(&spec(&clean_cmd)).unwrap();
-    wait(|| c.vm_trust(id).unwrap().1 == 2);
-    assert_eq!(c.vm_trust(id).unwrap(), (0, 2));
-    assert_eq!(c.call_out(CTL_CONSOLE_READ, &[id, 0], &mut []).unwrap().status, -1);
-    assert_eq!(c.call_out(CTL_GPU_READ, &[id, 0], &mut [0; 64 * 64 * 4]).unwrap().status, -1);
+    wait(|| c.vm_trust(id).unwrap().1 == 1);
+    assert_eq!(c.vm_trust(id).unwrap(), (0, 1));
+    assert_eq!(c.call_out(CTL_CONSOLE_WRITE, &[id, 1], &mut []).unwrap().status, -1);
+    assert_eq!(c.call_out(CTL_CONSOLE_READ, &[id, 0], &mut []).unwrap().status, 0);
+    assert_ne!(c.call_out(CTL_GPU_READ, &[id, 0], &mut [0; 64 * 64 * 4]).unwrap().status, -1);
+    assert_eq!(c.vm_trust(id).unwrap(), (0, 1));
     stopped(&c, id);
     c.vm_destroy(id).unwrap();
     let (next, _) = c.create_vm(&spec(&sealed_cmd)).unwrap();
     assert_eq!(next, id);
-    wait(|| c.vm_trust(id).unwrap().1 == 2);
+    printed(&c, id, b"FLAGVM: ready for input");
     assert_eq!(c.call(CTL_CONSOLE_WRITE, &[id, 12], b"provisioned\n", &[]).unwrap().vals[0], 12);
-    wait(|| c.vm_trust(id).unwrap().1 == 3);
+    wait(|| c.vm_trust(id).unwrap().1 == 1);
     assert_eq!(c.call_out(CTL_CONSOLE_WRITE, &[id, 1], &mut []).unwrap().status, -1);
-    assert_eq!(c.vm_trust(id).unwrap(), (1, 3));
+    assert_eq!(c.vm_trust(id).unwrap(), (1, 1));
     stopped(&c, id);
     c.vm_destroy(id).unwrap();
     let (next, _) = c.create_vm(&spec(&fresh_cmd)).unwrap();
@@ -160,11 +182,13 @@ fn dom0(no_tpm: bool) {
     c.call(CTL_VM_START, &[next, gpa, initrd.len() as u64], cmd("queued").as_bytes(), &[]).unwrap();
     stopped(&c, next);
     c.vm_destroy(next).unwrap();
-    // dom0's own reads and writes are exempt, even after it seals them.
-    attest::seal(&bits(&["console-in", "console-out"])).unwrap();
+    // dom0's own writes are exempt, even after it seals them; bit 1 is
+    // reserved.
+    assert_eq!(raw_attest(5, &bits(&["1"])), Err(22));
+    attest::seal(&bits(&["console-in"])).unwrap();
     c.call(CTL_CONSOLE_READ, &[0, 0], &[], &[]).unwrap();
     c.call(CTL_CONSOLE_WRITE, &[0, 1], b"\n", &[]).unwrap();
-    assert_eq!(c.vm_trust(0).unwrap(), (0, 3));
+    assert_eq!(c.vm_trust(0).unwrap(), (0, 1));
     println!("FLAGS: PASS{}", if no_tpm { " no TPM" } else { "" });
 }
 fn main() {

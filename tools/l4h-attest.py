@@ -1059,7 +1059,7 @@ def check_evidence(ev, pins, ak_name, ek_ca):
     return key, partition, host
 
 
-HOST_FLAGS = {"console-in": 0, "console-out": 1}
+HOST_FLAGS = {"console-in": 0}
 LINUX_TAINT = "PFSRMBUDAWCIOELKXTNJ"
 
 
@@ -1084,8 +1084,8 @@ def flag_spec(spec):
 
 
 def flag_name(bit):
-    if bit < 2:
-        return ("console-in", "console-out")[bit]
+    if bit == 0:
+        return "console-in"
     if 64 <= bit < 64 + len(LINUX_TAINT):
         return LINUX_TAINT[bit - 64]
     return None

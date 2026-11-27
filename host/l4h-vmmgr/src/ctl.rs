@@ -387,9 +387,8 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
             let off = a[1].min(head);
             let start = off.max(head.saturating_sub(host::CONSOLE_RING_DATA as u64));
             let n = (head - start).min(abi::CTL_DATA_MAX as u64) as usize;
-            // The answer gives `head` even when it copies nothing: how
-            // much the guest wrote is its output too.
-            if let Some(t) = &h.flags { t.act(g, caller, abi::FLAG_CONSOLE_OUT, head != 0)?; }
+            // Not gated by a flag: a guest's console output is diagnostic,
+            // not secret (DESIGN.md §10.2, Flags), and logd has it anyway.
             for i in 0..n {
                 let idx = (start as usize + i) % host::CONSOLE_RING_DATA;
                 resp.data[i] = unsafe { addr_of!((*ring).data[idx]).read_volatile() };
@@ -415,11 +414,7 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlR
             // Into dom0's control data area, which belongs to the host.
             let to = h.guest(caller).and_then(|d0| d0.ctl_data()).ok_or(EINVAL)? as *mut u8;
             let g = h.guest(vm_arg(a[0])?).ok_or(ENOENT)?;
-            if let Some(t) = &h.flags { t.act(g, caller, abi::FLAG_CONSOLE_OUT, false)?; }
-            resp.vals = crate::gpu::read(g, a[1], to, |effect| {
-                if let Some(t) = &h.flags { t.act(g, caller, abi::FLAG_CONSOLE_OUT, effect)?; }
-                Ok(())
-            })?;
+            resp.vals = crate::gpu::read(g, a[1], to)?;
             Ok(())
         }
         abi::CTL_CONSOLE_WRITE => {

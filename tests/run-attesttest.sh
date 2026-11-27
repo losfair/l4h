@@ -142,13 +142,13 @@ for phase in clean injected gates fresh queued; do
     field "$log" "FLAGVM: $phase report" "$out/run/$phase.report"
 done
 python3 "$attest" verify "$out/run/clean.report" "$out/run/evidence1" --data "$nonce" --ak-name "$ak" "${pcr_pins[@]}" \
-    --require-seal console-out > "$out/run/clean.json" || fail "clean sealed report"
+    > "$out/run/clean.json" || fail "clean sealed report"
 ! python3 "$attest" verify "$out/run/injected.report" "$out/run/evidence1" --ak-name "$ak" "${pcr_pins[@]}" --require-seal '' >/dev/null 2>&1 \
     || fail "injected input accepted"
 python3 "$attest" verify "$out/run/injected.report" "$out/run/evidence1" --ak-name "$ak" "${pcr_pins[@]}" --deny-taint '' --require-seal '' \
     > "$out/run/injected.json" || fail "allow input"
 python3 "$attest" verify "$out/run/gates.report" "$out/run/evidence1" --ak-name "$ak" "${pcr_pins[@]}" --deny-taint 130,131 \
-    --require-seal console-in,console-out,130,140-141 > "$out/run/gates.json" || fail "guest gates"
+    --require-seal console-in,130,140-141 > "$out/run/gates.json" || fail "guest gates"
 # Unsealed (console-in): refused by default, as input could follow.
 ! python3 "$attest" verify "$out/run/fresh.report" "$out/run/evidence1" --ak-name "$ak" "${pcr_pins[@]}" >/dev/null 2>&1 \
     || fail "unsealed report accepted"
@@ -165,7 +165,7 @@ def guest(phase):
     return json.loads((p / (phase + '.json')).read_text())['guest']
 clean, injected, gates, fresh, queued = map(guest, ['clean', 'injected', 'gates', 'fresh', 'queued'])
 assert int.from_bytes(bytes.fromhex(clean['taint']), 'little') == 0
-assert int.from_bytes(bytes.fromhex(clean['seal']), 'little') == 2
+assert int.from_bytes(bytes.fromhex(clean['seal']), 'little') == 1
 assert injected['taint_bits'] == ['0(console-in)']
 assert gates['taint_bits'] == ['0(console-in)', '65(F)', '140', '141', '200']
 assert fresh['taint_bits'] == fresh['seal_bits'] == []

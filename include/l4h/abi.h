@@ -1315,8 +1315,7 @@ enum l4h_attest_op {
 #define L4H_FLAG_GUEST          64  /* 64 + Linux TAINT_*; not sealable */
 #define L4H_FLAG_USER           128 /* 128-255: workload-defined gates */
 #define L4H_FLAG_CONSOLE_IN     (1u << 0)
-#define L4H_FLAG_CONSOLE_OUT    (1u << 1) /* text console and GPU_READ */
-#define L4H_FLAGS_HOST_DEFINED  0x3u
+#define L4H_FLAGS_HOST_DEFINED  0x1u /* bits 1-31 reserved */
 #define L4H_ACT_SEAL            (1u << 0) /* userspace bits: at most once */
 
 /* Bit n is bit n % 8 of byte n / 8. Empty ACT reads both bitmaps. */

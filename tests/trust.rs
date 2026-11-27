@@ -28,7 +28,10 @@ fn ranges_and_badges_cannot_be_bypassed() {
         assert_eq!(guest.is_ok(), n >= 64);
         if n < 64 { assert_eq!(e.read(), before); }
         let seal = update(&mut e, Sender::Trustd, FLAGS_SEAL, 1, &[n], 0);
-        assert_eq!(seal.is_ok(), n < 2 || n >= 128);
+        // Of the host bits only 0 (CONSOLE_IN) is defined; 1 (once
+        // CONSOLE_OUT) to 63 are reserved.
+        assert_eq!(seal.is_ok(), n == 0 || n >= 128);
+        if (1..64).contains(&n) { assert_eq!(seal, Err(22)); }
     }
     // An unknown caller never reaches update: the endpoint refuses it.
     assert_eq!(Sender::of_badge(99), None);
@@ -73,12 +76,12 @@ fn instances_are_monotonic_and_reset_only_on_replacement() {
     update(&mut e, Sender::Trustd, FLAGS_SEAL, 8, &[0], 0).unwrap();
     let before = e.read();
     assert_eq!(update(&mut e, Sender::Trustd, FLAGS_ACT, 7, &[], 0), Err(3));
-    assert_eq!(update(&mut e, Sender::Vmmgr, FLAGS_ACT, 0, &[1], 0), Err(22));
+    assert_eq!(update(&mut e, Sender::Vmmgr, FLAGS_ACT, 0, &[0], 0), Err(22));
     assert_eq!(e.read(), before);
     assert_eq!(before.for_instance(9).taint, [0; 4]);
     let next = update(&mut e, Sender::Trustd, FLAGS_ACT, 9, &[], 0).unwrap();
     assert_eq!(next, Flags { instance: 9, ..Flags::default() });
-    assert_eq!(update(&mut e, Sender::Vmmgr, FLAGS_ACT, 8, &[1], 0), Err(3));
+    assert_eq!(update(&mut e, Sender::Vmmgr, FLAGS_ACT, 8, &[0], 0), Err(3));
 }
 
 #[test]
@@ -102,7 +105,10 @@ fn only_the_registered_instance_replaces_an_entry() {
     // vmmgr acts before the guest starts (console input queued then).
     let f = registered(&mut e, Sender::Vmmgr, FLAGS_ACT, 6, 0, &[0], 0).unwrap();
     assert_eq!((f.instance, f.taint[0]), (6, 1));
-    assert_eq!(registered(&mut e, Sender::Vmmgr, FLAGS_ACT, 6, 6, &[1], 0).unwrap().taint[0], 3);
+    // The host actor acts on defined host bits only: bit 1 is reserved.
+    assert_eq!(registered(&mut e, Sender::Vmmgr, FLAGS_ACT, 6, 6, &[1], 0).map(|f| f.taint[0]), Err(22));
+    assert_eq!(registered(&mut e, Sender::Vmmgr, FLAGS_ACT, 6, 6, &[0], 0).unwrap().taint[0], 1);
+    assert_eq!(registered(&mut e, Sender::Vmmgr, FLAGS_ACT, 6, 6, &[0, 1], 0).map(|f| f.taint[0]), Err(22));
 }
 
 #[test]
@@ -111,9 +117,9 @@ fn cached_host_actions_check_the_seal_first() {
     assert_eq!(e.read().acted(1), Ok(false));
     update(&mut e, Sender::Vmmgr, FLAGS_ACT, 1, &[0], 0).unwrap();
     assert_eq!(e.read().acted(1), Ok(true));
-    let f = update(&mut e, Sender::Trustd, FLAGS_SEAL, 1, &[0, 1], 0).unwrap();
+    assert_eq!(update(&mut e, Sender::Trustd, FLAGS_SEAL, 1, &[0, 1], 0).map(|f| f.seal[0]), Err(22));
+    let f = update(&mut e, Sender::Trustd, FLAGS_SEAL, 1, &[0], 0).unwrap();
     assert_eq!(f.acted(1), Err(1));
-    assert_eq!(f.acted(2), Err(1));
     // An in-flight action checked before the seal already has its taint
     // in the answer. A clean seal cannot have passed an action.
     assert_eq!(f.taint[0] & f.seal[0], 1);

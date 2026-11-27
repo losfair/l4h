@@ -587,6 +587,9 @@ fn configure(g: &Guest, cfg: &mut hv::HvmConfig, host_info: &HostInfo) {
     (cfg.initrd_gpa, cfg.initrd_size) = boot.initrd;
     cfg.boot_flags = boot.flags;
     [cfg.epoch_ns, cfg.epoch_ticks] = host_info.clock_anchor;
+    // Guest console output is non-secret diagnostic output, mirrored to
+    // logd (the host's serial port and consoles) in every build; no flag
+    // gates it, nor dom0's CONSOLE_READ and GPU_READ.
     cfg.serial = 1;
     cfg.cmdline = boot.cmdline;
     cfg.attest = h.attest.is_some() as u32;

@@ -5,8 +5,7 @@
 # planning, block reservations and service replies, and host log
 # publication, wraparound and concurrent readers/writers. Also exercises
 # endpoint fairness, bounded network batches, VMM CPU budgets, malformed
-# replies, hotplug retries, USB DMA ownership and 64-bit addressing, and
-# the CONSOLE_OUT taint of dom0's console and display reads. --qemu
+# replies, hotplug retries and USB DMA ownership and 64-bit addressing. --qemu
 # also checks hypercalls under sustained console kicks.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -166,25 +165,6 @@ fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq) -> Result<(), Errno>
     }
 }
 ''')
-# What dom0's console and display reads disclose, and their taint.
-start = ctl.index('        abi::CTL_CONSOLE_READ => {')
-end = ctl.index('        abi::CTL_USB_ATTACH => {', start)
-gpu_start = ctl.index('        abi::CTL_GPU_READ => {')
-gpu_end = ctl.index('        abi::CTL_CONSOLE_WRITE => {', gpu_start)
-gpu = (root / 'host/l4h-vmmgr/src/gpu.rs').read_text()
-(out / 'console-taint.inc').write_text(vm_arg + '''
-fn execute(h: &mut Vmmgr, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlResp) -> Result<(), Errno> {
-    let a = &req.args;
-    match req.op {
-''' + ctl[start:end] + ctl[gpu_start:gpu_end] + '''
-        _ => unreachable!(),
-    }
-}
-mod gpu {
-    use super::*;
-''' + function(gpu, 'pub fn read(') + '''
-}
-''')
 PY
 cc -std=c11 -O2 -Wall -Wextra -Werror -I "$root/include" -I "$out" \
     -c "$root/tests/console-guest.c" -o "$out/console-guest.o"
@@ -285,10 +265,6 @@ L4H_DEVICES_SRC="$out/vmmgr-devices.inc" L4H_MAX_DEVICES_SRC="$out/max-devices.i
 L4H_VM_START_TEST_SRC="$out/vm-start.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_abi="$out/libl4h_abi.rlib" "$root/tests/vm-start.rs" -o "$out/vm-start-tests"
 "$out/vm-start-tests"
-L4H_CONSOLE_TAINT_TEST_SRC="$out/console-taint.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
-    --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" \
-    "$root/tests/console-taint.rs" -o "$out/console-taint-tests"
-"$out/console-taint-tests"
 rustc +stable --edition=2024 --crate-type rlib --crate-name l4h_virtio \
     "$root/host/l4h-virtio/src/lib.rs" -o "$out/libl4h_virtio.rlib"
 rustc +stable --edition=2024 --test -L dependency="$out" \
