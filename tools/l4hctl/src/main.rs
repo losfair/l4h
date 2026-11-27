@@ -261,7 +261,7 @@ In any guest:
                                name (VirtBackend) or number (0x0100)
 In any guest (flags work without a TPM):
   attest flags                show taint and seal bit lists
-  attest seal FLAG...         seal console-in, console-out or bits 128-255
+  attest seal FLAG...         seal console-in or bits 128-255
   attest act [--seal] BIT...   act on bits 128-255; --seal takes them once;
                                a refusal exits with status 1
   attest report [HEX] [-o F]   report on this guest with HEX (up to 64

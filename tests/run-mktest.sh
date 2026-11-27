@@ -318,9 +318,10 @@ done
 # own partition's evidence.
 p0=$out/att/1/p0 p1=$out/att/1/p1
 ak=$(json "$p0/dom0.json" 'd["host"]["ak_name"]')
+pcr2=$(json "$p0/dom0.json" 'd["host"]["pcrs"]["2"]')
 pcr4=$(json "$p0/dom0.json" 'd["host"]["pcrs"]["4"]')
 pcr9=$(json "$p0/dom0.json" 'd["host"]["pcrs"]["9"]')
-pcr_pins=(--pcr "4=$pcr4" --pcr "9=$pcr9")
+pcr_pins=(--pcr "2=$pcr2" --pcr "4=$pcr4" --pcr "9=$pcr9")
 [ "$(json "$p1/dom0.json" 'd["host"]["ak_name"]')" = "$ak" ] || fail "partitions quoted by different AKs"
 ! python3 "$tool" verify "$p1/vm.report" "$p0/evidence" --ak-name "$ak" "${pcr_pins[@]}" 2>/dev/null || fail "partition 1's report verified with partition 0's evidence"
 python3 "$tool" verify "$p1/vm.report" "$p1/evidence" --data "$nonce" --ak-name "$ak" "${pcr_pins[@]}" "${ca[@]}"

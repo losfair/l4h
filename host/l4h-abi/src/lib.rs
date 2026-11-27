@@ -647,8 +647,8 @@ pub const FLAG_HOST: usize = 0;
 pub const FLAG_GUEST: usize = 64;
 pub const FLAG_USER: usize = 128;
 pub const FLAG_CONSOLE_IN: u64 = 1 << 0;
-pub const FLAG_CONSOLE_OUT: u64 = 1 << 1;
-pub const FLAGS_HOST_DEFINED: u64 = 3;
+/// Bits 1-31 are reserved.
+pub const FLAGS_HOST_DEFINED: u64 = 1;
 pub const ACT_SEAL: u32 = 1;
 #[repr(C)]
 pub struct AttestAct {

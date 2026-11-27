@@ -119,11 +119,12 @@ json() { python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(eval
 [ "$(json "$out/run/vm.json" 'd["guest"]["dom0"]')" = False ] || fail "guest marked dom0"
 [ "$(json "$out/run/vm.json" 'd["guest"]["ram"]')" = $((64 << 20)) ] || fail "guest RAM"
 # The firmware and GRUB measured the boot.
+pcr2=$(json "$out/run/dom0.json" 'd["host"]["pcrs"]["2"]')
 pcr4=$(json "$out/run/dom0.json" 'd["host"]["pcrs"]["4"]')
 pcr9=$(json "$out/run/dom0.json" 'd["host"]["pcrs"]["9"]')
 [ "$pcr4" != "$(printf '0%.0s' $(seq 64))" ] || fail "PCR 4 empty"
 [ "$pcr9" != "$(printf '0%.0s' $(seq 64))" ] || fail "PCR 9 empty"
-pcr_pins=(--pcr "4=$pcr4" --pcr "9=$pcr9")
+pcr_pins=(--pcr "2=$pcr2" --pcr "4=$pcr4" --pcr "9=$pcr9")
 # Tampering is caught.
 cp "$out/run/dom0.report" "$out/run/bad.report"
 printf '\x00' | dd of="$out/run/bad.report" bs=1 seek=40 conv=notrunc status=none
@@ -141,13 +142,13 @@ for phase in clean injected gates fresh queued; do
     field "$log" "FLAGVM: $phase report" "$out/run/$phase.report"
 done
 python3 "$attest" verify "$out/run/clean.report" "$out/run/evidence1" --data "$nonce" --ak-name "$ak" "${pcr_pins[@]}" \
-    --require-seal console-out > "$out/run/clean.json" || fail "clean sealed report"
+    > "$out/run/clean.json" || fail "clean sealed report"
 ! python3 "$attest" verify "$out/run/injected.report" "$out/run/evidence1" --ak-name "$ak" "${pcr_pins[@]}" --require-seal '' >/dev/null 2>&1 \
     || fail "injected input accepted"
 python3 "$attest" verify "$out/run/injected.report" "$out/run/evidence1" --ak-name "$ak" "${pcr_pins[@]}" --deny-taint '' --require-seal '' \
     > "$out/run/injected.json" || fail "allow input"
 python3 "$attest" verify "$out/run/gates.report" "$out/run/evidence1" --ak-name "$ak" "${pcr_pins[@]}" --deny-taint 130,131 \
-    --require-seal console-in,console-out,130,140-141 > "$out/run/gates.json" || fail "guest gates"
+    --require-seal console-in,130,140-141 > "$out/run/gates.json" || fail "guest gates"
 # Unsealed (console-in): refused by default, as input could follow.
 ! python3 "$attest" verify "$out/run/fresh.report" "$out/run/evidence1" --ak-name "$ak" "${pcr_pins[@]}" >/dev/null 2>&1 \
     || fail "unsealed report accepted"
@@ -164,7 +165,7 @@ def guest(phase):
     return json.loads((p / (phase + '.json')).read_text())['guest']
 clean, injected, gates, fresh, queued = map(guest, ['clean', 'injected', 'gates', 'fresh', 'queued'])
 assert int.from_bytes(bytes.fromhex(clean['taint']), 'little') == 0
-assert int.from_bytes(bytes.fromhex(clean['seal']), 'little') == 2
+assert int.from_bytes(bytes.fromhex(clean['seal']), 'little') == 1
 assert injected['taint_bits'] == ['0(console-in)']
 assert gates['taint_bits'] == ['0(console-in)', '65(F)', '140', '141', '200']
 assert fresh['taint_bits'] == fresh['seal_bits'] == []

@@ -292,6 +292,10 @@ UP_TO_DATE = [tcb_level("UpToDate", tdx=(3, 0, 5) + (0,) * 13)]
 
 CC_EVENTS = [(1, 0x80000008, b"TDVF hob"), (1, 0x80000001, b"SecureBoot"), (2, 0x80000003, b"l4h-fl4.efi"),
              (2, 0x80000007, b"Exit Boot Services Invocation"), (3, 0xD, b"root task")]
+# UEFI drivers and applications the TD firmware loaded from outside itself
+# (option ROMs), in RTMR 0 (register index 1).
+CC_DRIVERS = [(1, 0x80000004, b"boot services driver"), (1, 0x80000005, b"runtime services driver"),
+              (1, 0x80000003, b"option rom application")]
 
 
 class Host:
@@ -431,6 +435,32 @@ class Tdx(unittest.TestCase):
         self.assertEqual(s["rtmrs"]["2"], self.rtmrs[2].hex())
         self.assertEqual(s["events"][2]["rtmr"], 1)
         self.assertTrue(a.is_cc_event_log(log) and not a.is_cc_event_log(tpm_log))
+
+    def test_cc_event_log_efi_drivers(self):
+        for driver in CC_DRIVERS:
+            events = [driver] + CC_EVENTS
+            r = replay(events)
+            q = make_quote(self.intel, self.fields(rtmr0=r[0], rtmr1=r[1], rtmr2=r[2]))
+            self.refused(self.evidence(q), r"^CC event 0: %s in RTMR 0: .*--allow-efi-drivers accepts it$"
+                         % a.EVENT_TYPES[driver[1]], cc_event_log=ccel(events))
+            _, info = self.check(self.evidence(q), cc_event_log=ccel(events), allow_efi_drivers=True)
+            self.assertEqual((info["cc_event_log_events"], info["cc_event_log_efi_drivers"]), (len(events), 1))
+        events = CC_DRIVERS + CC_EVENTS
+        r = replay(events)
+        q = make_quote(self.intel, self.fields(rtmr0=r[0], rtmr1=r[1], rtmr2=r[2]))
+        _, info = self.check(self.evidence(q), cc_event_log=ccel(events), allow_efi_drivers=True)
+        self.assertEqual(info["cc_event_log_efi_drivers"], 3)
+        # In RTMR 1 or 2 (l4h's own application is RTMR 1's), or not a
+        # driver or application: not what this checks.
+        events = [(2, 0x80000004, b"rtmr 1"), (3, 0x80000005, b"rtmr 2"), (2, 0x80000003, b"application"),
+                  (1, 0x80000001, b"variable")] + CC_EVENTS
+        r = replay(events)
+        q = make_quote(self.intel, self.fields(rtmr0=r[0], rtmr1=r[1], rtmr2=r[2]))
+        _, info = self.check(self.evidence(q), cc_event_log=ccel(events))
+        self.assertEqual(info["cc_event_log_efi_drivers"], 0)
+        # No event log: nothing to count.
+        _, info = self.check(self.evidence())
+        self.assertNotIn("cc_event_log_efi_drivers", info)
 
     def test_measurement_pins(self):
         self.check(self.evidence(), mrtd=b"\x11" * 48, rtmrs={0: self.rtmrs[0], 2: self.rtmrs[2]})
@@ -991,6 +1021,28 @@ class Tdx(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn("INSECURE: --insecure-unpinned-measurements", r.stderr)
             self.assertFalse(json.loads(r.stdout)["tdx"]["measurements_pinned"])
+            # RTMR 0 neither pinned nor replayed: a warning, not a refusal;
+            # either one alone silences it.
+            r = self.run_tool("verify", p["rep"], p["tdx"], "--intel-root-ca", root, "--collateral-dir", col, *tdx_pins)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stderr.count("WARNING"), 1, r.stderr)
+            self.assertRegex(r.stderr, r"^l4h-attest: WARNING: RTMR 0 was neither pinned \(--rtmr 0=\.\.\.\) nor replayed "
+                             r"\(--cc-event-log\): the TD firmware's configuration \(TDHOB, CFV\), its ACPI tables and the "
+                             r"UEFI drivers it loaded before l4h were NOT checked\n$")
+            self.assertNotIn("INSECURE", r.stderr)
+            for extra in (("--rtmr", "0=" + self.rtmrs[0].hex()), ("--cc-event-log", p["log"])):
+                r = self.run_tool("verify", p["rep"], p["tdx"], "--intel-root-ca", root, "--collateral-dir", col,
+                                  *tdx_pins, *extra)
+                self.assertEqual((r.returncode, r.stderr), (0, ""), extra)
+            r = self.run_tool("verify", p["rep"], p["tdx"], "--intel-root-ca", root, "--collateral-dir", col,
+                              *tdx_pins, "--rtmr", "0=" + "00" * 48)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("RTMR 0 is", r.stderr)
+            # With the TPM's evidence too, still a warning of its own.
+            r = self.run_tool("verify", p["rep"], p["both"], "--intel-root-ca", root, "--collateral-dir", col, *tdx_pins,
+                              "--insecure-unpinned-ak", "--insecure-unpinned-measurements")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("WARNING: RTMR 0 was neither pinned", r.stderr)
             # Without collateral: refused, unless skipped explicitly (with a warning).
             r = self.run_tool("verify", p["rep"], p["tdx"], "--intel-root-ca", root, *tdx_pins)
             self.assertEqual(r.returncode, 1)
@@ -1014,7 +1066,7 @@ class Tdx(unittest.TestCase):
                 self.assertEqual(out["host"]["key"], out["tdx"]["key"])
             # --ignore-tpm on v=3 combined evidence verifies TDX alone without needing TPM options.
             r = self.run_tool("verify", p["rep"], p["both"], "--ignore-tpm", "--intel-root-ca", root,
-                              "--collateral-dir", col, *tdx_pins)
+                              "--collateral-dir", col, *tdx_pins, "--rtmr", "0=" + self.rtmrs[0].hex())
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(set(json.loads(r.stdout)), {"tdx", "guest"})
             self.assertNotIn("warning", r.stderr.lower())
@@ -1086,9 +1138,19 @@ class Tdx(unittest.TestCase):
             self.assertEqual(r.returncode, 1)
             self.assertIn("--insecure-unpinned-measurements", r.stderr)
             r = self.run_tool("verify-tdx-quote", p["ans"], "--intel-root-ca", root, "--tdx-evidence", p["tdx"], "--data", b"fresh".hex(),
-                              "--collateral-dir", col, *tdx_pins)
+                              "--collateral-dir", col, *tdx_pins, "--cc-event-log", p["log"])
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertNotIn("warning", r.stderr.lower())
+            # Neither --rtmr 0 nor --cc-event-log: warned of; --rtmr 0
+            # alone silences it.
+            r = self.run_tool("verify-tdx-quote", p["ans"], "--intel-root-ca", root, "--tdx-evidence", p["tdx"], "--data", b"fresh".hex(),
+                              "--collateral-dir", col, *tdx_pins)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stderr.count("WARNING"), 1, r.stderr)
+            self.assertIn("WARNING: RTMR 0 was neither pinned (--rtmr 0=...) nor replayed (--cc-event-log)", r.stderr)
+            r = self.run_tool("verify-tdx-quote", p["ans"], "--intel-root-ca", root, "--tdx-evidence", p["tdx"], "--data", b"fresh".hex(),
+                              "--collateral-dir", col, *tdx_pins, "--rtmr", "0=" + self.rtmrs[0].hex())
+            self.assertEqual((r.returncode, r.stderr), (0, ""))
             out = json.loads(r.stdout)
             self.assertEqual(set(out), {"tdx", "guest"})
             self.assertTrue(out["tdx"]["measurements_pinned"])
@@ -1102,6 +1164,36 @@ class Tdx(unittest.TestCase):
             r = self.run_tool("event-log", p["log"])
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(json.loads(r.stdout)["rtmrs"]["0"], self.rtmrs[0].hex())
+            # A CC event log with option ROM drivers in RTMR 0: refused by
+            # default on verify-tdx-quote and verify, accepted with
+            # --allow-efi-drivers (and a warning).
+            events = CC_DRIVERS + CC_EVENTS
+            dr = replay(events)
+            df = dict(rtmr0=dr[0], rtmr1=dr[1], rtmr2=dr[2])
+            report = self.host.report(b"fresh")
+            dans = {"key": self.host.cose_key(), "report": report, "quote": make_quote(
+                self.intel, self.fields(rtmr3=a.tdx_rtmr_extended(self.binding), reportdata=a.tdx_guest_report_data(report), **df),
+                5, 3)}
+            p.update(self.files(d, dans=dans, dlog=ccel(events), dtdx=self.evidence(make_quote(self.intel, self.fields(**df))),
+                                drep=self.host.report(b"cli")))
+            dpins = ["--mrtd", (b"\x11" * 48).hex(), "--rtmr", "1=" + dr[1].hex(), "--rtmr", "2=" + dr[2].hex()]
+            for cmd in (["verify-tdx-quote", p["dans"], "--tdx-evidence", p["dtdx"]], ["verify", p["drep"], p["dtdx"]]):
+                base = cmd + ["--intel-root-ca", root, "--collateral-dir", col, *dpins, "--cc-event-log", p["dlog"]]
+                r = self.run_tool(*base)
+                self.assertEqual(r.returncode, 1, cmd)
+                self.assertEqual(r.stdout, "")
+                self.assertRegex(r.stderr, "^l4h-attest: CC event 0: EV_EFI_BOOT_SERVICES_DRIVER in RTMR 0: .*"
+                                 "--allow-efi-drivers accepts it\n$")
+                r = self.run_tool(*base, "--allow-efi-drivers")
+                self.assertEqual(r.returncode, 0, (cmd, r.stderr))
+                self.assertEqual(json.loads(r.stdout)["tdx"]["cc_event_log_efi_drivers"], 3)
+                self.assertEqual(r.stderr.count("WARNING"), 1, r.stderr)
+                self.assertIn("WARNING: --allow-efi-drivers: the event log shows 3 UEFI driver(s) or application(s) from "
+                              "outside the firmware (option ROMs; RTMR 0)", r.stderr)
+                # Without an event log there is nothing to allow.
+                r = self.run_tool(*cmd, "--intel-root-ca", root, "--collateral-dir", col, *dpins, "--allow-efi-drivers")
+                self.assertEqual(r.returncode, 1, cmd)
+                self.assertRegex(r.stderr, "^l4h-attest: --allow-efi-drivers without ")
             r = self.run_tool("verify", p["tdx"], p["tdx"], "--rtmr", "3=" + "00" * 48, "--intel-root-ca", root)
             self.assertEqual(r.returncode, 1)
             self.assertIn("RTMR 0, 1 or 2", r.stderr)

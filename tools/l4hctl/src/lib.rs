@@ -434,9 +434,8 @@ impl Ctl {
     fn call_buf(&self, op: u32, args: &[u64], data: &[u8], buf: u64, len: usize) -> Result<Box<Resp>> {
         let resp = self.raw_call(op, args, data, buf, len)?;
         if resp.status < 0 {
-            if resp.status == -1 && matches!(op, CTL_CONSOLE_READ | CTL_CONSOLE_WRITE | CTL_GPU_READ) {
-                let kind = if op == CTL_CONSOLE_WRITE { "input" } else { "output" };
-                return err(format!("{kind} sealed by the guest"));
+            if resp.status == -1 && op == CTL_CONSOLE_WRITE {
+                return err("input sealed by the guest");
             }
             return err(format!("request {op} failed: {}", errno_name(-resp.status)));
         }
@@ -1931,7 +1930,6 @@ pub mod attest {
         for s in spec {
             let bit = match *s {
                 "console-in" => 0,
-                "console-out" => 1,
                 _ => s.parse::<usize>().map_err(|_| Error(format!("unknown flag: {s}")))?,
             };
             if bit >= FLAG_BITS { return err(format!("flag out of range: {s}")); }
@@ -1947,7 +1945,6 @@ pub mod attest {
             if bits[i / 8] & (1 << (i % 8)) == 0 { continue; }
             out.push(match i {
                 0 => "0(console-in)".into(),
-                1 => "1(console-out)".into(),
                 i if (64..64 + TAINT.len()).contains(&i) => format!("{i}({})", TAINT[i - 64] as char),
                 _ => i.to_string(),
             });

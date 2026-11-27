@@ -242,6 +242,7 @@ name = "trustd-key"
 version = "0.1.0"
 dependencies = [
  "p256",
+ "sha2",
 ]
 
 [[package]]
